@@ -8,7 +8,7 @@ public, MIT). Commands are for Git Bash from the repo root.
 1. **Clean tree, right version**
    - `git status` shows nothing to commit.
    - `Cargo.toml` `version = "1.0.0"`; `docs/release-notes/v1.0.0.md` exists;
-     the README's download name matches (`CursorDrop-v1.0.0-win64.zip`).
+     the README links to `releases/latest`, so it needs no change per version.
 2. **Build the package**: `cmd //c setup\\package.bat`
    - runs `cargo test --release`, builds, checks `CursorDrop.exe --version`, writes
      `dist/CursorDrop-v1.0.0-win64.zip` and `.zip.sha256`.
@@ -37,7 +37,8 @@ public, MIT). Commands are for Git Bash from the repo root.
 ## Later releases
 
 1. Bump `version` in `Cargo.toml` (the exe's version info and `--version` follow it).
-2. Add `docs/release-notes/v<version>.md`; update the download name in `README.md`.
+2. Add `docs/release-notes/v<version>.md` (the README's download button and link point at
+   `releases/latest` and follow on their own).
 3. Commit, then steps 2, 3 and 5 above with the new version (the repo already exists, so
    just `git push` instead of step 4).
 

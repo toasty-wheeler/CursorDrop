@@ -1,5 +1,7 @@
 # CursorDrop
 
+[![Download the latest CursorDrop for Windows](https://img.shields.io/github/v/release/toasty-wheeler/CursorDrop?style=for-the-badge&label=Download&logo=windows&color=e91e63)](https://github.com/toasty-wheeler/CursorDrop/releases/latest)
+
 Drop a mouse-cursor pack into a folder and it becomes your Windows cursors. No unzipping,
 no right-click > Install on an `.inf`, no Control Panel.
 
@@ -16,8 +18,8 @@ replace before you use it.
 
 ## Download
 
-Get `CursorDrop-v1.0.0-win64.zip` from [Releases](../../releases), unzip it anywhere and run
-`CursorDrop.exe`. It's portable: no installer and no admin rights. Windows 10 or 11, 64-bit.
+Get the `CursorDrop-v…-win64.zip` from the [latest release](https://github.com/toasty-wheeler/CursorDrop/releases/latest),
+unzip it anywhere and run `CursorDrop.exe`. It's portable: no installer and no admin rights. Windows 10 or 11, 64-bit.
 
 ## Using it
 
