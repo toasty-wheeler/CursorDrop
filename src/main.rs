@@ -28,6 +28,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const APP_NAME: &str = "CursorDrop";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CLASS_NAME: &str = "CursorDropWnd";
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_WINDOW: u32 = WM_APP + 2;
@@ -99,6 +100,21 @@ thread_local! {
     static TASKBAR_CREATED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Where the cursors and data folders live: next to the exe (portable), or, if that folder
+/// can't be written to (e.g. Program Files), %LOCALAPPDATA%CursorDrop.
+fn base_dir(exe: &Path) -> PathBuf {
+    let here = exe.parent().unwrap().to_path_buf();
+    let probe = here.join(".cursordrop-write-test");
+    if fs::write(&probe, b"").is_ok() {
+        let _ = fs::remove_file(&probe);
+        return here;
+    }
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(local) => PathBuf::from(local).join(APP_NAME),
+        None => here,
+    }
+}
+
 fn file_sig(p: &Path) -> Option<(u64, u64)> {
     let m = fs::metadata(p).ok()?;
     let mtime = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -108,7 +124,7 @@ fn file_sig(p: &Path) -> Option<(u64, u64)> {
 impl App {
     fn new() -> App {
         let exe = std::env::current_exe().expect("exe path");
-        let base = exe.parent().unwrap().to_path_buf();
+        let base = base_dir(&exe);
         let drop_dir = base.join("cursors");
         let data_dir = base.join("data");
         let _ = fs::create_dir_all(&drop_dir);
@@ -748,11 +764,15 @@ fn run(show: bool) {
 
         gfx::startup();
         let hinst = GetModuleHandleW(null());
-        // The mouse icon from the Mouse control panel; fall back to the generic app icon.
-        let cpl = wide("main.cpl");
-        let mut icon = ExtractIconW(hinst, cpl.as_ptr(), 0);
-        if (icon as usize) <= 1 {
+        // Our own icon (resource 1), at the tray's small size; the window gets both sizes.
+        let load = |metric_x: SYSTEM_METRICS_INDEX, metric_y: SYSTEM_METRICS_INDEX| {
+            LoadImageW(hinst, 1 as *const u16, IMAGE_ICON, GetSystemMetrics(metric_x), GetSystemMetrics(metric_y), 0) as HICON
+        };
+        let mut icon = load(SM_CXSMICON, SM_CYSMICON);
+        let mut big = load(SM_CXICON, SM_CYICON);
+        if icon.is_null() {
             icon = LoadIconW(null_mut(), IDI_APPLICATION);
+            big = icon;
         }
 
         let class = wide(CLASS_NAME);
@@ -760,7 +780,7 @@ fn run(show: bool) {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             lpszClassName: class.as_ptr(),
-            hIcon: icon,
+            hIcon: big,
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             ..std::mem::zeroed()
         };
@@ -781,6 +801,7 @@ fn run(show: bool) {
         let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, x, y, ww, wh, null_mut(), null_mut(), hinst, null());
         TASKBAR_CREATED.with(|c| c.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
         DragAcceptFiles(hwnd, 1);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
 
         let mut app = App::new();
         app.hwnd = hwnd;
@@ -866,6 +887,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--inspect") if args.len() >= 2 => std::process::exit(inspect(Path::new(&args[1]))),
+        Some("--version") => println!("{APP_NAME} {VERSION}"),
+        Some("--make-icon") if args.len() >= 2 => {
+            if let Err(e) = gfx::make_icon(Path::new(&args[1])) {
+                println!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("--restore") => {
             let mut app = App::new();
             match app.restore() {

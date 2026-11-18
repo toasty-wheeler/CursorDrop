@@ -359,6 +359,10 @@ fn default_cursor(role: usize) -> String {
 
 /// What Windows uses for each role right now.
 fn current_cursors() -> Vec<String> {
+    // Screenshots for the README show Windows' own cursors as "Now", not whoever runs them.
+    if std::env::var_os("CURSORDROP_SELFTEST_NOW_DEFAULT").is_some() {
+        return (0..ROLES.len()).map(default_cursor).collect();
+    }
     (0..ROLES.len())
         .map(|i| match cursors::get_string(cursors::CURSORS_KEY, Some(ROLES[i])) {
             Some(v) if !v.trim().is_empty() => expand_env(&v),
@@ -731,10 +735,29 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
     app.ui.shell = shell;
 }
 
+/// The exe's own icon (resource 1) at a pixel size, loaded once per size.
+fn app_icon(px: i32) -> HICON {
+    thread_local! {
+        static ICONS: std::cell::RefCell<HashMap<i32, usize>> = std::cell::RefCell::new(HashMap::new());
+    }
+    ICONS.with(|c| {
+        *c.borrow_mut().entry(px).or_insert_with(|| unsafe {
+            let hinst = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null());
+            LoadImageW(hinst, 1 as *const u16, IMAGE_ICON, px, px, 0) as usize
+        }) as HICON
+    })
+}
+
 fn draw_list_header(pt: &mut Painter, model: &Model, m: f32) {
     let p = pt.p;
     let y = pt.s(20.0);
-    pt.g.text(G_MOUSE, &pt.f.icon, pt.accent, R::new(m, y, pt.s(22.0), pt.s(28.0)), Align::Center, Align::Center);
+    let icon_px = pt.s(24.0).round();
+    let icon = app_icon(icon_px as i32);
+    if icon.is_null() {
+        pt.g.text(G_MOUSE, &pt.f.icon, pt.accent, R::new(m, y, pt.s(22.0), pt.s(28.0)), Align::Center, Align::Center);
+    } else {
+        pt.g.cursor(icon, m - pt.s(1.0), y + (pt.s(28.0) - icon_px) / 2.0, icon_px, 0, None);
+    }
     pt.g.label("CursorDrop", &pt.f.title, p.text, R::new(m + pt.s(28.0), y, pt.s(400.0), pt.s(28.0)));
     let packs = model.packs.iter().filter(|p| p.inst.error.is_none()).count();
     let status = match (packs, model.active_name()) {

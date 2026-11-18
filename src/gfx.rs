@@ -476,3 +476,101 @@ impl CursorCache {
 pub fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, null(), FALSE) };
 }
+
+// ---------------------------------------------------------------- app icon
+
+/// Draws the CursorDrop icon (a gradient tile with a white pointer) at `px` pixels into an
+/// ARGB bitmap and returns it as PNG bytes.
+fn icon_png(px: i32, tmp: &std::path::Path) -> Option<Vec<u8>> {
+    const PIXEL_FORMAT_32BPP_ARGB: i32 = 0x0026_200A;
+    unsafe {
+        let mut bmp = null_mut();
+        if GdipCreateBitmapFromScan0(px, px, 0, PIXEL_FORMAT_32BPP_ARGB, null(), &mut bmp) != 0 {
+            return None;
+        }
+        let mut g = null_mut();
+        GdipGetImageGraphicsContext(bmp.cast(), &mut g);
+        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+        GdipGraphicsClear(g, 0);
+        let k = px as f32 / 256.0;
+        let gfx = Gfx { g };
+
+        // Tile: pink to violet, corner to corner, with a soft light along the top.
+        let tile = R::new(10.0 * k, 10.0 * k, 236.0 * k, 236.0 * k);
+        let path = round_path(tile, 58.0 * k);
+        let (p1, p2) = (PointF { X: tile.x, Y: tile.y }, PointF { X: tile.right(), Y: tile.bottom() });
+        let mut grad = null_mut();
+        GdipCreateLineBrush(&p1, &p2, argb(255, 255, 79, 139), argb(255, 123, 92, 255), WrapModeTileFlipXY, &mut grad);
+        GdipFillPath(g, grad.cast(), path);
+        GdipDeleteBrush(grad.cast());
+        GdipDeletePath(path);
+        gfx.glow(128.0 * k, 40.0 * k, 150.0 * k, 70.0 * k, argb(70, 255, 255, 255));
+
+        // The pointer: the classic arrow, white with a dark outline and a little shadow.
+        let pts: [(f32, f32); 7] = [(86.0, 46.0), (86.0, 196.0), (121.0, 163.0), (146.0, 216.0), (171.0, 204.0), (146.0, 152.0), (194.0, 152.0)];
+        let draw = |dx: f32, dy: f32, fill: Color, outline: Option<(Color, f32)>| {
+            let p: Vec<PointF> = pts.iter().map(|&(x, y)| PointF { X: (x + dx) * k, Y: (y + dy) * k }).collect();
+            let mut path = null_mut();
+            GdipCreatePath(FillModeAlternate, &mut path);
+            GdipAddPathPolygon(path, p.as_ptr(), p.len() as i32);
+            GdipClosePathFigure(path);
+            if let Some((c, w)) = outline {
+                let mut pen = null_mut();
+                GdipCreatePen1(c, (w * k).max(1.0), UnitPixel, &mut pen);
+                GdipSetPenLineJoin(pen, LineJoinRound);
+                GdipDrawPath(g, pen, path);
+                GdipDeletePen(pen);
+            }
+            let b = brush(fill);
+            GdipFillPath(g, b.cast(), path);
+            GdipDeleteBrush(b.cast());
+            GdipDeletePath(path);
+        };
+        draw(6.0, 8.0, argb(70, 40, 0, 60), Some((argb(70, 40, 0, 60), 20.0)));
+        draw(0.0, 0.0, WHITE, Some((argb(255, 28, 28, 30), 20.0)));
+        std::mem::forget(gfx); // `g` is deleted below, after the image it draws on
+        GdipDeleteGraphics(g);
+
+        let file = tmp.join(format!("icon-{px}.png"));
+        let png = windows_sys::core::GUID {
+            data1: 0x557CF406,
+            data2: 0x1A04,
+            data3: 0x11D3,
+            data4: [0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E],
+        };
+        let w = wide(&file.to_string_lossy());
+        let ok = GdipSaveImageToFile(bmp.cast(), w.as_ptr(), &png, null()) == 0;
+        GdipDisposeImage(bmp.cast());
+        let bytes = if ok { std::fs::read(&file).ok() } else { None };
+        let _ = std::fs::remove_file(&file);
+        bytes
+    }
+}
+
+/// Writes a multi-size .ico (PNG-compressed images, which Windows Vista and later read).
+/// Used to make assets\CursorDrop.ico: `CursorDrop.exe --make-icon <file.ico>`.
+pub fn make_icon(out: &std::path::Path) -> Result<(), String> {
+    startup();
+    let sizes = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256];
+    let tmp = std::env::temp_dir();
+    let images: Vec<(i32, Vec<u8>)> =
+        sizes.iter().map(|&s| icon_png(s, &tmp).map(|b| (s, b)).ok_or(format!("could not draw {s} px"))).collect::<Result<_, _>>()?;
+    let mut ico = Vec::new();
+    ico.extend([0u8, 0, 1, 0]);
+    ico.extend((images.len() as u16).to_le_bytes());
+    let mut offset = 6 + 16 * images.len() as u32;
+    for (s, data) in &images {
+        let d = if *s >= 256 { 0 } else { *s as u8 };
+        ico.extend([d, d, 0, 0]);
+        ico.extend(1u16.to_le_bytes());
+        ico.extend(32u16.to_le_bytes());
+        ico.extend((data.len() as u32).to_le_bytes());
+        ico.extend(offset.to_le_bytes());
+        offset += data.len() as u32;
+    }
+    for (_, data) in &images {
+        ico.extend(data);
+    }
+    std::fs::write(out, ico).map_err(|e| e.to_string())
+}

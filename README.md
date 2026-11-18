@@ -1,56 +1,90 @@
 # CursorDrop
 
-A small Windows tray app (Rust) that applies mouse-cursor packs automatically.
+Drop a mouse-cursor pack into a folder and it becomes your Windows cursors. No unzipping,
+no right-click > Install on an `.inf`, no Control Panel.
 
-Drop a cursor pack archive (`.zip`, `.7z` or `.rar`) into the `cursors` folder next to
-`CursorDrop.exe` and within a couple of seconds it becomes your Windows cursor scheme.
+CursorDrop is a small Windows app (Rust, no runtime needed) that watches its `cursors`
+folder. Put a pack there as you downloaded it (`.zip`, `.7z` or `.rar`) and within a couple
+of seconds it's applied. A window lists your packs and shows every cursor a pack will
+replace before you use it.
 
-## How it works
+![The pack list](docs/list.png)
 
-- Every 2 s the `cursors` folder is checked. A new or changed archive is processed once its
-  size has stopped changing (so half-copied downloads are not read).
-- Only `.cur`, `.ani` and `.inf` files are extracted, into `data\schemes\<archive>\`.
-- Cursor roles are mapped from the pack's install `.inf` when present, otherwise guessed from
-  file names (`Normal Select`, `Busy`, `aero_ns`, `Diagonal Resize 1`, `link`, ...).
-  Roles a pack doesn't provide fall back to the Windows built-in cursor.
-- An archive with several variants (one `.inf` or folder per variant) gives several schemes;
-  the first is applied and the others can be chosen from the tray menu. Variants are named after
-  their folder only (folders every variant shares are left out); Windows' Mouse settings get
-  "Pack - Folder" so names stay unique.
-- Applying writes `HKCU\Control Panel\Cursors`, registers the scheme in Mouse Properties and
-  reloads cursors (`SPI_SETCURSORS`). Your previous cursors are saved first.
-- Deleting an archive from the folder removes its files, and if it was active your previous
-  cursors come back.
+![The cursors in a pack, now vs. new](docs/cursors.png)
 
-## Window
+## Download
 
-Styled like DS4-Native and MagicMouseNative: translucent cards, Windows accent colour, an
-Automatic / Light / Dark theme menu and an always-on-top pin.
+Get `CursorDrop-v1.0.0-win64.zip` from [Releases](../../releases), unzip it anywhere and run
+`CursorDrop.exe`. It's portable: no installer and no admin rights. Windows 10 or 11, 64-bit.
 
-- **Packs list**, like Explorer's details view: Name, Date modified, Type, Size and a preview of
-  each pack's cursors. Click a column header to sort, drag a divider to resize. Right-click a pack
-  for more.
-- **Click a pack** to see a grid of all 17 cursors it replaces, what you have now next to what
-  you'd get (animated `.ani` cursors play). Packs with variants get browser-style tabs: they keep a minimum width and
-  scroll when there are many (arrows at the ends, or the mouse wheel / tilt over them), a
-  hovered tab shows its full name, and Left / Right switch variants. From there: use the
-  cursors, show the archive in Explorer, or remove the pack (to the Recycle Bin).
-- **Add pack…** or drag archives onto the window to copy them into the cursors folder.
-- Closing the window keeps CursorDrop in the tray; click the tray icon to bring it back.
-  With "Start with Windows" on it starts in the tray (`--tray`).
+## Using it
 
-## Tray menu
+- **Add a pack:** put the archive in the `cursors` folder next to `CursorDrop.exe`, click
+  **Add pack…**, or drag it onto the window. It's applied straight away.
+- **See what changes:** click a pack. Each of the 17 Windows cursors is shown as it is now
+  and as it would be with the pack; animated `.ani` cursors play.
+- **Variants:** packs with several versions (sizes, colours, characters…) get browser-style
+  tabs, named after their folders. Many variants scroll: use the arrows, the mouse wheel
+  over the tabs, or Left / Right. Hover a tab to see its full name.
+- **Undo:** CursorDrop remembers your cursors before it applies a pack. **Restore original
+  cursors** brings them back, and so does deleting the pack from the folder (or
+  **Remove pack**, which moves it to the Recycle Bin).
+- **Tray:** closing the window keeps CursorDrop in the tray, still watching the folder.
+  **Start with Windows** starts it there at sign-in.
+- **Looks:** follows Windows' light/dark setting and accent colour, or pick Light / Dark;
+  the pin keeps the window on top.
 
-Open CursorDrop · Pick a scheme · Open cursors folder · Rescan now · Restore original cursors ·
-Start with Windows · Exit.
+## How it works out the cursors
+
+- If the pack has an install `.inf`, its cursor list is used as-is.
+- Otherwise file names are matched to cursor roles: `Normal Select`, `Busy`, `Working In
+  Background`, `Diagonal Resize 1`, `aero_ns`, `link`, `unavailable`, and so on.
+- Every folder (or `.inf`) with cursors becomes one variant. Archives inside the archive
+  (common for "all-in-one" packs) are opened too, up to three levels deep.
+- Cursors a pack doesn't provide fall back to the Windows default.
+- Only `.cur`, `.ani` and `.inf` files are extracted, and paths are checked so nothing can be
+  written outside CursorDrop's folder.
+
+Applying a pack writes your user's cursor settings (`HKEY_CURRENT_USER\Control Panel\Cursors`),
+adds the scheme to Control Panel > Mouse > Pointers and tells Windows to reload the cursors.
+Nothing system-wide is changed.
+
+## Where things are kept
+
+Next to `CursorDrop.exe`: `cursors\` (your packs) and `data\` (extracted cursors, settings,
+a log). If that folder can't be written to, both live in `%LOCALAPPDATA%\CursorDrop`.
 
 ## Command line
 
-- `CursorDrop.exe --inspect <archive>` prints which file would go to which cursor role.
-- `CursorDrop.exe --restore` restores the cursors saved before CursorDrop applied one.
-- `CURSORDROP_SELFTEST=<folder>` installs the packs without applying them, renders every view
-  to PNGs in that folder, clicks through the UI and prints ok/FAILED per check, then exits.
+| | |
+|---|---|
+| `CursorDrop.exe` | Opens the window (or brings up the running one). |
+| `CursorDrop.exe --tray` | Starts in the tray only (used by Start with Windows). |
+| `CursorDrop.exe --inspect <pack>` | Prints which file goes to which cursor; changes nothing. |
+| `CursorDrop.exe --restore` | Restores the cursors you had before CursorDrop. |
+| `CursorDrop.exe --version` | Prints the version. |
 
-## Build
+## Building
 
-`cargo build --release` (MSVC toolchain; the RAR support compiles bundled C++ unrar code).
+Needs Rust (MSVC toolchain) and the Windows SDK (for `rc.exe`; it comes with Visual Studio's
+C++ workload). RAR support compiles the bundled UnRAR C++ source.
+
+```
+cargo build --release
+```
+
+`setup\package.bat` runs the tests, builds, and writes the release zip and its SHA-256 to
+`dist\`.
+
+For development, `CURSORDROP_SELFTEST=<folder>` installs the packs in the `cursors` folder
+without applying them, renders every view to PNGs in `<folder>`, clicks through the UI and
+prints `ok` / `FAILED` per check. No window is shown and your cursors aren't touched.
+(`CURSORDROP_SELFTEST_NOW_DEFAULT=1` shows Windows' default cursors as "Now", as in the
+screenshots above.)
+
+## License
+
+MIT, see [LICENSE](LICENSE). Third-party components and their licenses (including the
+UnRAR license) are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The screenshots use the classic and large cursor sets that ship with Windows.
