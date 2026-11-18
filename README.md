@@ -14,7 +14,9 @@ Drop a cursor pack archive (`.zip`, `.7z` or `.rar`) into the `cursors` folder n
   file names (`Normal Select`, `Busy`, `aero_ns`, `Diagonal Resize 1`, `link`, ...).
   Roles a pack doesn't provide fall back to the Windows built-in cursor.
 - An archive with several variants (one `.inf` or folder per variant) gives several schemes;
-  the first is applied and the others can be chosen from the tray menu.
+  the first is applied and the others can be chosen from the tray menu. Variants are named after
+  their folder only (folders every variant shares are left out); Windows' Mouse settings get
+  "Pack - Folder" so names stay unique.
 - Applying writes `HKCU\Control Panel\Cursors`, registers the scheme in Mouse Properties and
   reloads cursors (`SPI_SETCURSORS`). Your previous cursors are saved first.
 - Deleting an archive from the folder removes its files, and if it was active your previous

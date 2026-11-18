@@ -463,7 +463,7 @@ impl Model {
 
     fn active_name(&self) -> Option<String> {
         let a = self.active.as_ref()?;
-        Some(self.pack(&a.archive)?.inst.schemes.get(a.scheme)?.name.clone())
+        Some(self.pack(&a.archive)?.inst.schemes.get(a.scheme)?.display().to_string())
     }
 }
 
@@ -1029,7 +1029,7 @@ fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, varian
     let y = pt.s(20.0);
     pt.icon_button(R::new(m, y, pt.s(36.0), pt.s(36.0)), Kind::Back, G_BACK, None, false);
     let tx = m + pt.s(50.0);
-    pt.g.label(&scheme.name, &pt.f.title, p.text, R::new(tx, y - pt.s(2.0), pt.s(520.0), pt.s(28.0)));
+    pt.g.label(scheme.display(), &pt.f.title, p.text, R::new(tx, y - pt.s(2.0), pt.s(520.0), pt.s(28.0)));
     let status = format!(
         "{}   \u{00B7}   {} of {} cursors{}",
         pack.inst.archive,
@@ -1041,7 +1041,7 @@ fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, varian
 
     let mut top = content.y;
     if pack.inst.schemes.len() > 1 {
-        let labels: Vec<String> = pack.inst.schemes.iter().map(|s| s.name.clone()).collect();
+        let labels: Vec<String> = pack.inst.schemes.iter().map(|s| s.display().to_string()).collect();
         draw_tabs(pt, &mut ui.tabs, R::new(content.x, top, content.w, pt.s(TAB_H)), &labels, variant);
         top += pt.s(TAB_H + 12.0);
     } else {

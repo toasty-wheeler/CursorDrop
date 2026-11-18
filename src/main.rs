@@ -56,7 +56,14 @@ struct State {
     backup: Option<cursors::Backup>,
     #[serde(default)]
     ui: ui::UiSettings,
+    /// Extraction / naming version the installed packs were made with (see FORMAT).
+    #[serde(default)]
+    format: u32,
 }
+
+/// Bump when extraction or scheme naming changes: installed packs are then re-extracted once.
+/// 2: archives inside archives, UTF-8 zip names, short variant labels.
+const FORMAT: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Installed {
@@ -159,7 +166,14 @@ impl App {
         }
     }
 
+    /// Applies a scheme. Returns the name shown to the user.
     pub fn apply(&mut self, target: Active) -> Result<String, String> {
+        self.apply_inner(target, true)
+    }
+
+    /// `may_back_up`: false when the cursors in use are known to be ours already (even if
+    /// their scheme name changed), so they never get saved as the "original" cursors.
+    fn apply_inner(&mut self, target: Active, may_back_up: bool) -> Result<String, String> {
         let inst = self.find(&target.archive).ok_or("archive not installed")?;
         let scheme = inst.schemes.get(target.scheme).ok_or("no such scheme")?.clone();
         let dir = self.scheme_dir(&target.archive);
@@ -169,7 +183,7 @@ impl App {
             .map(|f| f.as_ref().map(|rel| dir.join(rel).to_string_lossy().to_string()))
             .collect();
         if !self.no_apply {
-            if !self.ours_is_current() {
+            if may_back_up && !self.ours_is_current() {
                 // Remember what the user had so "Restore original cursors" can bring it back.
                 self.state.backup = Some(cursors::take_backup());
             }
@@ -179,7 +193,7 @@ impl App {
         self.save();
         self.log(&format!("applied '{}' ({} of {} cursors)", scheme.name, scheme.mapped(), ROLES.len()));
         gfx::invalidate(self.ui.hwnd);
-        Ok(scheme.name)
+        Ok(scheme.display().to_string())
     }
 
     pub fn restore(&mut self) -> Result<(), String> {
@@ -306,43 +320,53 @@ impl App {
         note
     }
 
-    /// Re-reads installed packs from their extracted files, so improvements to detection (or
-    /// ordering) reach packs added by an older version. The active variant is kept by name.
+    /// Packs added by an older version are extracted and read again once, so changes to
+    /// extraction (archives inside archives, file-name encoding) and naming reach them. The
+    /// variant in use is found again by name, then by label, then by position.
     fn refresh_installed(&mut self) {
-        let active_name = self.active_scheme().map(|s| s.name.clone());
-        for i in 0..self.state.installed.len() {
-            let inst = &self.state.installed[i];
-            if inst.error.is_some() {
-                continue;
-            }
-            let dir = self.scheme_dir(&inst.archive);
-            if !dir.is_dir() {
-                continue;
-            }
-            let stem = Path::new(&inst.archive).file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let schemes = scheme::discover(&dir, &stem);
-            if schemes.is_empty() {
-                continue;
-            }
-            let archive = inst.archive.clone();
-            self.state.installed[i].schemes = schemes;
-            if let (Some(a), Some(name)) = (self.state.active.as_mut(), active_name.as_ref()) {
-                if a.archive == archive {
-                    if let Some(idx) = self.state.installed[i].schemes.iter().position(|s| s.name == *name) {
-                        a.scheme = idx;
-                    }
+        if self.state.format >= FORMAT {
+            return;
+        }
+        let active = self.state.active.clone();
+        let active_scheme = self.active_scheme().cloned();
+        let old: Vec<Installed> = self.state.installed.clone();
+        for inst in &old {
+            let path = self.drop_dir.join(&inst.archive);
+            let Some(sig) = file_sig(&path) else { continue };
+            let fresh = self.install(&inst.archive, sig);
+            if !self.no_apply {
+                for s in &inst.schemes {
+                    cursors::unregister_scheme(&s.name);
                 }
             }
+            if let (Some(a), Some(was)) = (&active, &active_scheme) {
+                if a.archive == inst.archive {
+                    let idx = fresh
+                        .schemes
+                        .iter()
+                        .position(|s| s.name == was.name)
+                        .or_else(|| fresh.schemes.iter().position(|s| s.display() == was.display()))
+                        .unwrap_or(a.scheme);
+                    self.state.active = Some(Active { archive: a.archive.clone(), scheme: idx });
+                }
+            }
+            if let Some(slot) = self.state.installed.iter_mut().find(|i| i.archive == inst.archive) {
+                *slot = fresh;
+            }
+            self.log(&format!("re-read {} for the new format", inst.archive));
         }
+        self.state.format = FORMAT;
         self.save();
     }
 
     fn startup(&mut self) {
+        // Checked before re-reading the packs, which can rename the scheme in use.
+        let ours = self.ours_is_current();
         self.refresh_installed();
         // If the cursors in use are ours, re-apply so paths stay valid even if the folder moved.
         if let Some(a) = self.state.active.clone() {
-            if self.ours_is_current() {
-                let _ = self.apply(a);
+            if ours && self.find(&a.archive).is_some_and(|i| a.scheme < i.schemes.len()) {
+                let _ = self.apply_inner(a, false);
             } else {
                 self.state.active = None;
                 self.save();
@@ -406,7 +430,7 @@ fn tray_add(app: &App) {
 
 fn tooltip(app: &App) -> String {
     match app.active_scheme() {
-        Some(s) if app.ours_is_current() => format!("{APP_NAME} - {}", s.name),
+        Some(s) if app.ours_is_current() => format!("{APP_NAME} - {}", s.display()),
         _ => format!("{APP_NAME} - drop cursor packs into the cursors folder"),
     }
 }
@@ -469,9 +493,9 @@ fn show_menu(app: &mut App) {
                 let t = Active { archive: inst.archive.clone(), scheme: i };
                 let checked = if active.as_ref() == Some(&t) { MF_CHECKED } else { MF_UNCHECKED };
                 let label = if s.mapped() < ROLES.len() {
-                    format!("{}   ({}/{})", s.name, s.mapped(), ROLES.len())
+                    format!("{}   ({}/{})", s.display(), s.mapped(), ROLES.len())
                 } else {
-                    s.name.clone()
+                    s.display().to_string()
                 };
                 append(target, MF_STRING | checked, CMD_SCHEME_BASE + app.menu_map.len(), &label);
                 app.menu_map.push(t);
@@ -807,7 +831,7 @@ fn inspect(path: &Path) -> i32 {
             let schemes = scheme::discover(&tmp, &stem);
             println!("{}: {n} cursor/inf file(s) extracted, {} scheme(s)", path.display(), schemes.len());
             for s in &schemes {
-                println!("\n[{}]  {}/{} roles", s.name, s.mapped(), ROLES.len());
+                println!("\n[{}]  {}/{} roles   (Windows scheme name: {})", s.display(), s.mapped(), ROLES.len(), s.name);
                 for (i, f) in s.files.iter().enumerate() {
                     println!("  {:<22} {}", ROLE_LABELS[i], f.as_deref().unwrap_or("(Windows default)"));
                 }

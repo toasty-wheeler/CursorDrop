@@ -21,7 +21,11 @@ pub const ROLE_LABELS: [&str; 17] = [
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scheme {
+    /// Unique name, also used for the scheme in Windows' Mouse settings ("Pack - Folder").
     pub name: String,
+    /// What the window shows (tabs, title): just the variant's own folder or .inf name.
+    #[serde(default)]
+    pub label: String,
     /// One entry per ROLES slot: path relative to the extraction folder.
     pub files: Vec<Option<String>>,
 }
@@ -29,6 +33,10 @@ pub struct Scheme {
 impl Scheme {
     pub fn mapped(&self) -> usize {
         self.files.iter().filter(|f| f.is_some()).count()
+    }
+
+    pub fn display(&self) -> &str {
+        if self.label.is_empty() { &self.name } else { &self.label }
     }
 }
 
@@ -114,10 +122,8 @@ pub fn discover(root: &Path, fallback_name: &str) -> Vec<Scheme> {
                 files[i] = Some(rel_string(root, &p));
             }
         }
-        let s = Scheme {
-            name: name.unwrap_or_else(|| inf.file_stem().unwrap().to_string_lossy().to_string()),
-            files,
-        };
+        let name = name.unwrap_or_else(|| inf.file_stem().unwrap().to_string_lossy().to_string());
+        let s = Scheme { label: fix_mojibake(&name), name, files };
         if usable(&s) {
             covered_dirs.insert(inf_dir.to_path_buf());
             schemes.push(s);
@@ -133,7 +139,7 @@ pub fn discover(root: &Path, fallback_name: &str) -> Vec<Scheme> {
             None => by_dir.push((d, vec![c.clone()])),
         }
     }
-    let mut heuristic_count = 0;
+    let mut folders: Vec<(usize, Vec<String>)> = Vec::new(); // scheme index, folder path parts
     for (dir, files_in_dir) in by_dir {
         if covered_dirs.contains(&dir) {
             continue;
@@ -147,24 +153,21 @@ pub fn discover(root: &Path, fallback_name: &str) -> Vec<Scheme> {
                 }
             }
         }
-        // Variant folders are named after their own folder ("Pack - Dark"); fixed up below
-        // when the archive turns out to hold just one scheme.
-        let name = match dir.strip_prefix(root).ok().and_then(|r| r.file_name()) {
-            Some(leaf) => format!("{fallback_name} - {}", leaf.to_string_lossy()),
-            None => fallback_name.to_string(),
-        };
-        let s = Scheme { name, files };
+        let s = Scheme { name: String::new(), label: String::new(), files };
         if usable(&s) {
-            heuristic_count += 1;
+            let parts = dir
+                .strip_prefix(root)
+                .map(|r| r.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect())
+                .unwrap_or_default();
+            folders.push((schemes.len(), parts));
             schemes.push(s);
         }
     }
-    if schemes.len() == 1 && heuristic_count == 1 {
-        schemes[0].name = fallback_name.to_string();
-    }
+    label_folders(&mut schemes, &folders, fallback_name);
 
-    // Unique names (the name is also used as the Control Panel scheme name).
+    // Unique names (the name is also used as the Control Panel scheme name), unique labels.
     let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen_labels: HashMap<String, usize> = HashMap::new();
     for s in &mut schemes {
         s.name = s.name.replace(',', " ").trim().to_string();
         if s.name.is_empty() {
@@ -175,8 +178,61 @@ pub fn discover(root: &Path, fallback_name: &str) -> Vec<Scheme> {
         if *n > 1 {
             s.name = format!("{} ({})", s.name, n);
         }
+        if s.label.trim().is_empty() {
+            s.label = s.name.clone();
+        }
+        let n = seen_labels.entry(s.label.to_lowercase()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            s.label = format!("{} ({})", s.label, n);
+        }
     }
     schemes
+}
+
+/// Undoes UTF-8 that was decoded as Latin-1 and encoded again ("Î£" back to "Σ"), which some
+/// zip tools write into the archive itself. Names that don't decode that way are kept as-is.
+pub fn fix_mojibake(s: &str) -> String {
+    if s.is_ascii() || s.chars().any(|c| c as u32 > 0xFF) {
+        return s.to_string();
+    }
+    let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+    match String::from_utf8(bytes) {
+        Ok(fixed) => fixed,
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Names folder-based schemes after their folders. Folders every variant sits in (the pack's
+/// own top folder, or an archive that was inside the archive) are left out, so variants in
+/// "Pack/Dark" and "Pack/Light" are just "Dark" and "Light", and deeper ones keep only the
+/// parts that tell them apart ("Dark / Large"). A pack with a single scheme is named after
+/// the archive.
+fn label_folders(schemes: &mut [Scheme], folders: &[(usize, Vec<String>)], pack: &str) {
+    if schemes.len() == 1 && folders.len() == 1 {
+        schemes[0].name = pack.to_string();
+        schemes[0].label = pack.to_string();
+        return;
+    }
+    let common = match folders.split_first() {
+        Some((first, rest)) if !rest.is_empty() => {
+            let mut n = first.1.len();
+            for (_, parts) in rest {
+                n = n.min(first.1.iter().zip(parts).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count());
+            }
+            n
+        }
+        // A lone folder scheme next to .inf schemes: drop all but its own folder.
+        Some((only, _)) => only.1.len().saturating_sub(1),
+        None => 0,
+    };
+    for (i, parts) in folders {
+        let own: Vec<String> = parts[common.min(parts.len())..].iter().map(|p| fix_mojibake(p)).collect();
+        let own = own.join(" / ");
+        let label = if own.is_empty() { pack.to_string() } else { own };
+        schemes[*i].name = if label == pack { pack.to_string() } else { format!("{pack} - {label}") };
+        schemes[*i].label = label;
+    }
 }
 
 fn usable(s: &Scheme) -> bool {
@@ -477,6 +533,43 @@ link          = "Link.ani"
         assert_eq!(files[7].as_deref(), Some("Unavailable.cur"));
         assert_eq!(files[14].as_deref(), Some("Link.ani"));
         assert!(files[15].is_none());
+    }
+
+    fn labels_for(dirs: &[&str]) -> Vec<(String, String)> {
+        let mut schemes: Vec<Scheme> =
+            dirs.iter().map(|_| Scheme { name: String::new(), label: String::new(), files: vec![] }).collect();
+        let folders: Vec<(usize, Vec<String>)> = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, d.split('/').filter(|s| !s.is_empty()).map(String::from).collect()))
+            .collect();
+        label_folders(&mut schemes, &folders, "Pack");
+        schemes.into_iter().map(|s| (s.label, s.name)).collect()
+    }
+
+    #[test]
+    fn variant_labels_are_folder_names() {
+        // An archive inside the archive becomes a folder every variant shares: left out.
+        let l = labels_for(&["EXTRACT TO C WINDOWS CURSORS/[pixloen] Gold Ship", "EXTRACT TO C WINDOWS CURSORS/[pixloen] Vodka"]);
+        assert_eq!(l[0], ("[pixloen] Gold Ship".into(), "Pack - [pixloen] Gold Ship".into()));
+        assert_eq!(l[1].0, "[pixloen] Vodka");
+        // Deeper levels keep what tells them apart.
+        let l = labels_for(&["Pack/Dark/Large", "Pack/Dark/Small", "Pack/Light/Large"]);
+        assert_eq!(l.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["Dark / Large", "Dark / Small", "Light / Large"]);
+        // Cursors in the shared folder itself are named after the pack.
+        let l = labels_for(&["Pack", "Pack/Extras"]);
+        assert_eq!(l[0].0, "Pack");
+        assert_eq!(l[1].0, "Extras");
+        // A single scheme is just the pack.
+        assert_eq!(labels_for(&["Some/Deep/Folder"])[0], ("Pack".into(), "Pack".into()));
+    }
+
+    #[test]
+    fn mojibake() {
+        assert_eq!(fix_mojibake("[pixloen] Agnes Tachyon [Î£ Experiment]"), "[pixloen] Agnes Tachyon [Σ Experiment]");
+        assert_eq!(fix_mojibake("Café"), "Café");
+        assert_eq!(fix_mojibake("Σ already fine"), "Σ already fine");
+        assert_eq!(fix_mojibake("plain"), "plain");
     }
 
     #[test]
