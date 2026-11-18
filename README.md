@@ -20,15 +20,32 @@ Drop a cursor pack archive (`.zip`, `.7z` or `.rar`) into the `cursors` folder n
 - Deleting an archive from the folder removes its files, and if it was active your previous
   cursors come back.
 
+## Window
+
+Styled like DS4-Native and MagicMouseNative: translucent cards, Windows accent colour, an
+Automatic / Light / Dark theme menu and an always-on-top pin.
+
+- **Packs list**, like Explorer's details view: Name, Date modified, Type, Size and a preview of
+  each pack's cursors. Click a column header to sort, drag a divider to resize. Right-click a pack
+  for more.
+- **Click a pack** to see a grid of all 17 cursors it replaces, what you have now next to what
+  you'd get (animated `.ani` cursors play). Packs with variants get tabs. From there: use the
+  cursors, show the archive in Explorer, or remove the pack (to the Recycle Bin).
+- **Add pack…** or drag archives onto the window to copy them into the cursors folder.
+- Closing the window keeps CursorDrop in the tray; click the tray icon to bring it back.
+  With "Start with Windows" on it starts in the tray (`--tray`).
+
 ## Tray menu
 
-Pick a scheme · Open cursors folder · Rescan now · Restore original cursors ·
-Start with Windows · Exit. Double-click the icon to open the cursors folder.
+Open CursorDrop · Pick a scheme · Open cursors folder · Rescan now · Restore original cursors ·
+Start with Windows · Exit.
 
 ## Command line
 
 - `CursorDrop.exe --inspect <archive>` prints which file would go to which cursor role.
 - `CursorDrop.exe --restore` restores the cursors saved before CursorDrop applied one.
+- `CURSORDROP_SELFTEST=<folder>` installs the packs without applying them, renders every view
+  to PNGs in that folder, clicks through the UI and prints ok/FAILED per check, then exits.
 
 ## Build
 

@@ -1,10 +1,13 @@
 #![windows_subsystem = "windows"]
 //! CursorDrop: drop a cursor-pack archive (.zip / .7z / .rar) into the `cursors` folder next to
-//! the exe and it becomes your Windows cursor scheme. Lives in the system tray.
+//! the exe and it becomes your Windows cursor scheme. A window lists the packs (Explorer-style)
+//! and shows every cursor a pack replaces; the app keeps running in the tray.
 
 mod archive;
 mod cursors;
+mod gfx;
 mod scheme;
+mod ui;
 
 use cursors::wide;
 use scheme::{ROLE_LABELS, ROLES, Scheme};
@@ -17,16 +20,27 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::UNIX_EPOCH;
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const APP_NAME: &str = "CursorDrop";
+const CLASS_NAME: &str = "CursorDropWnd";
 const WM_TRAY: u32 = WM_APP + 1;
+const WM_SHOW_WINDOW: u32 = WM_APP + 2;
 const TIMER_SCAN: usize = 1;
+const TIMER_ANIM: usize = 2;
 const SCAN_MS: u32 = 2000;
+const ANIM_MS: u32 = 33;
+const CLIENT_W: f32 = 1100.0;
+const CLIENT_H: f32 = 720.0;
 
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
+const CMD_SHOW: usize = 6;
 const CMD_OPEN: usize = 1;
 const CMD_RESCAN: usize = 2;
 const CMD_RESTORE: usize = 3;
@@ -39,32 +53,37 @@ struct State {
     installed: Vec<Installed>,
     active: Option<Active>,
     backup: Option<cursors::Backup>,
+    #[serde(default)]
+    ui: ui::UiSettings,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Installed {
-    archive: String,
-    size: u64,
-    mtime: u64,
-    schemes: Vec<Scheme>,
-    error: Option<String>,
+pub struct Installed {
+    pub archive: String,
+    pub size: u64,
+    pub mtime: u64,
+    pub schemes: Vec<Scheme>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-struct Active {
-    archive: String,
-    scheme: usize,
+pub struct Active {
+    pub archive: String,
+    pub scheme: usize,
 }
 
-struct App {
+pub struct App {
     exe: PathBuf,
-    drop_dir: PathBuf,
+    pub drop_dir: PathBuf,
     data_dir: PathBuf,
     state: State,
     pending: HashMap<String, (u64, u64)>,
     hwnd: HWND,
     icon: HICON,
     menu_map: Vec<Active>,
+    /// Self-test: never touch the real cursors.
+    no_apply: bool,
+    pub ui: ui::Ui,
 }
 
 thread_local! {
@@ -99,10 +118,12 @@ impl App {
             hwnd: null_mut(),
             icon: null_mut(),
             menu_map: Vec::new(),
+            no_apply: false,
+            ui: ui::Ui::default(),
         }
     }
 
-    fn save(&self) {
+    pub fn save(&self) {
         if let Ok(s) = serde_json::to_string_pretty(&self.state) {
             let _ = fs::write(self.data_dir.join("state.json"), s);
         }
@@ -115,11 +136,11 @@ impl App {
         }
     }
 
-    fn scheme_dir(&self, archive: &str) -> PathBuf {
+    pub fn scheme_dir(&self, archive: &str) -> PathBuf {
         self.data_dir.join("schemes").join(archive)
     }
 
-    fn find(&self, archive: &str) -> Option<&Installed> {
+    pub fn find(&self, archive: &str) -> Option<&Installed> {
         self.state.installed.iter().find(|i| i.archive == archive)
     }
 
@@ -129,14 +150,15 @@ impl App {
     }
 
     /// True if the cursors Windows is using right now are the scheme we applied.
-    fn ours_is_current(&self) -> bool {
+    pub fn ours_is_current(&self) -> bool {
         match self.active_scheme() {
+            Some(_) if self.no_apply => true,
             Some(s) => cursors::current_scheme_name().is_some_and(|n| n == s.name),
             None => false,
         }
     }
 
-    fn apply(&mut self, target: Active) -> Result<String, String> {
+    pub fn apply(&mut self, target: Active) -> Result<String, String> {
         let inst = self.find(&target.archive).ok_or("archive not installed")?;
         let scheme = inst.schemes.get(target.scheme).ok_or("no such scheme")?.clone();
         let dir = self.scheme_dir(&target.archive);
@@ -145,23 +167,29 @@ impl App {
             .iter()
             .map(|f| f.as_ref().map(|rel| dir.join(rel).to_string_lossy().to_string()))
             .collect();
-        if !self.ours_is_current() {
-            // Remember what the user had so "Restore original cursors" can bring it back.
-            self.state.backup = Some(cursors::take_backup());
+        if !self.no_apply {
+            if !self.ours_is_current() {
+                // Remember what the user had so "Restore original cursors" can bring it back.
+                self.state.backup = Some(cursors::take_backup());
+            }
+            cursors::apply(&scheme.name, &paths)?;
         }
-        cursors::apply(&scheme.name, &paths)?;
         self.state.active = Some(target);
         self.save();
         self.log(&format!("applied '{}' ({} of {} cursors)", scheme.name, scheme.mapped(), ROLES.len()));
+        gfx::invalidate(self.ui.hwnd);
         Ok(scheme.name)
     }
 
-    fn restore(&mut self) -> Result<(), String> {
+    pub fn restore(&mut self) -> Result<(), String> {
         let b = self.state.backup.clone().ok_or("nothing to restore")?;
-        cursors::restore(&b)?;
+        if !self.no_apply {
+            cursors::restore(&b)?;
+        }
         self.state.active = None;
         self.save();
         self.log("restored original cursors");
+        gfx::invalidate(self.ui.hwnd);
         Ok(())
     }
 
@@ -196,6 +224,7 @@ impl App {
             .unwrap_or_default();
         present.sort_by_key(|(_, sig)| sig.1);
         let mut note: Option<(String, bool)> = None;
+        let mut changed = false;
 
         // Archives that were deleted from the folder.
         let gone: Vec<Installed> = self
@@ -206,6 +235,7 @@ impl App {
             .cloned()
             .collect();
         for inst in gone {
+            changed = true;
             let was_active = self.state.active.as_ref().is_some_and(|a| a.archive == inst.archive);
             if was_active && self.ours_is_current() {
                 let _ = self.restore();
@@ -214,8 +244,10 @@ impl App {
             if was_active {
                 self.state.active = None;
             }
-            for s in &inst.schemes {
-                cursors::unregister_scheme(&s.name);
+            if !self.no_apply {
+                for s in &inst.schemes {
+                    cursors::unregister_scheme(&s.name);
+                }
             }
             let _ = fs::remove_dir_all(self.scheme_dir(&inst.archive));
             self.state.installed.retain(|i| i.archive != inst.archive);
@@ -235,6 +267,7 @@ impl App {
                 self.pending.insert(name, sig);
                 continue;
             }
+            changed = true;
             self.pending.remove(&name);
             let inst = self.install(&name, sig);
             match &inst.error {
@@ -247,18 +280,23 @@ impl App {
                     to_apply = Some(Active { archive: name.clone(), scheme: 0 });
                 }
             }
-            for old in self.find(&name).map(|i| i.schemes.clone()).unwrap_or_default() {
-                cursors::unregister_scheme(&old.name);
+            if !self.no_apply {
+                for old in self.find(&name).map(|i| i.schemes.clone()).unwrap_or_default() {
+                    cursors::unregister_scheme(&old.name);
+                }
             }
             self.state.installed.retain(|i| i.archive != name);
             self.state.installed.push(inst);
             self.save();
         }
+        if changed {
+            ui::changed_files(self);
+        }
         if let Some(t) = to_apply {
             let extra = self.find(&t.archive).map_or(0, |i| i.schemes.len().saturating_sub(1));
             match self.apply(t) {
                 Ok(n) => {
-                    let more = if extra > 0 { format!(" ({extra} more variant(s) in the tray menu)") } else { String::new() };
+                    let more = if extra > 0 { format!(" ({extra} more variant(s) to pick from)") } else { String::new() };
                     note = Some((format!("Now using \"{n}\"{more}"), false));
                 }
                 Err(e) => note = Some((format!("Could not apply: {e}"), true)),
@@ -279,20 +317,36 @@ impl App {
         }
     }
 
-    fn startup_enabled(&self) -> bool {
+    pub fn startup_enabled(&self) -> bool {
         cursors::get_string(cursors::RUN_KEY, Some(APP_NAME)).is_some()
     }
 
-    fn toggle_startup(&self) {
+    pub fn toggle_startup(&self) {
         if self.startup_enabled() {
             cursors::delete_value(cursors::RUN_KEY, APP_NAME);
         } else {
-            let _ = cursors::set_string(cursors::RUN_KEY, Some(APP_NAME), &format!("\"{}\"", self.exe.display()), false);
+            let cmd = format!("\"{}\" --tray", self.exe.display());
+            let _ = cursors::set_string(cursors::RUN_KEY, Some(APP_NAME), &cmd, false);
         }
+        gfx::invalidate(self.ui.hwnd);
+    }
+
+    fn window_visible(&self) -> bool {
+        !self.hwnd.is_null() && unsafe { IsWindowVisible(self.hwnd) } != 0
     }
 }
 
-// ---------------------------------------------------------------- tray UI
+/// Scans now (no waiting for the file to settle) and reports what happened.
+pub fn rescan(app: &mut App) {
+    if let Some((msg, err)) = app.scan(false) {
+        if !app.window_visible() || err {
+            balloon(app, &msg, err);
+        }
+    }
+    gfx::invalidate(app.ui.hwnd);
+}
+
+// ---------------------------------------------------------------- tray
 
 fn copy_wide(dst: &mut [u16], s: &str) {
     let w: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
@@ -324,7 +378,10 @@ fn tooltip(app: &App) -> String {
     }
 }
 
-fn tray_update_tip(app: &App) {
+pub fn refresh_tray(app: &App) {
+    if app.hwnd.is_null() {
+        return;
+    }
     let mut nid = tray_data(app);
     nid.uFlags = NIF_TIP;
     copy_wide(&mut nid.szTip, &tooltip(app));
@@ -332,6 +389,9 @@ fn tray_update_tip(app: &App) {
 }
 
 fn balloon(app: &App, text: &str, error: bool) {
+    if app.hwnd.is_null() {
+        return;
+    }
     let mut nid = tray_data(app);
     nid.uFlags = NIF_INFO;
     copy_wide(&mut nid.szInfoTitle, APP_NAME);
@@ -357,10 +417,8 @@ fn show_menu(app: &mut App) {
         let current = app.ours_is_current();
         let active = if current { app.state.active.clone() } else { None };
 
-        match app.active_scheme() {
-            Some(s) if current => append(menu, MF_STRING | MF_GRAYED, 0, &format!("Active: {}", s.name)),
-            _ => append(menu, MF_STRING | MF_GRAYED, 0, "Active: (not a CursorDrop scheme)"),
-        }
+        append(menu, MF_STRING, CMD_SHOW, "Open CursorDrop");
+        SetMenuDefaultItem(menu, CMD_SHOW as u32, 0);
         append(menu, MF_SEPARATOR, 0, "");
 
         if app.state.installed.is_empty() {
@@ -404,15 +462,7 @@ fn show_menu(app: &mut App) {
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
         SetForegroundWindow(app.hwnd);
-        let cmd = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-            pt.x,
-            pt.y,
-            0,
-            app.hwnd,
-            null(),
-        ) as usize;
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, app.hwnd, null()) as usize;
         PostMessageW(app.hwnd, WM_NULL, 0, 0);
         DestroyMenu(menu); // also destroys submenus
         if cmd != 0 {
@@ -421,20 +471,30 @@ fn show_menu(app: &mut App) {
     }
 }
 
-fn open_folder(app: &App) {
+pub fn open_folder(app: &App) {
     let op = wide("open");
     let path = wide(&app.drop_dir.to_string_lossy());
     unsafe { ShellExecuteW(null_mut(), op.as_ptr(), path.as_ptr(), null(), null(), SW_SHOWNORMAL) };
 }
 
+fn show_window(app: &mut App) {
+    unsafe {
+        if IsIconic(app.hwnd) != 0 {
+            ShowWindow(app.hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(app.hwnd, SW_SHOW);
+        }
+        SetForegroundWindow(app.hwnd);
+        SetTimer(app.hwnd, TIMER_ANIM, ANIM_MS, None);
+    }
+    gfx::invalidate(app.hwnd);
+}
+
 fn run_command(app: &mut App, cmd: usize) {
     match cmd {
+        CMD_SHOW => show_window(app),
         CMD_OPEN => open_folder(app),
-        CMD_RESCAN => {
-            if let Some((msg, err)) = app.scan(false) {
-                balloon(app, &msg, err);
-            }
-        }
+        CMD_RESCAN => rescan(app),
         CMD_RESTORE => match app.restore() {
             Ok(()) => balloon(app, "Original cursors restored.", false),
             Err(e) => balloon(app, &e, true),
@@ -453,17 +513,19 @@ fn run_command(app: &mut App, cmd: usize) {
         }
         _ => {}
     }
-    tray_update_tip(app);
+    refresh_tray(app);
 }
 
-fn with_app(f: impl FnOnce(&mut App)) {
+fn with_app(f: impl FnOnce(&mut App)) -> bool {
     APP.with(|a| {
         if let Ok(mut guard) = a.try_borrow_mut() {
             if let Some(app) = guard.as_mut() {
                 f(app);
+                return true;
             }
         }
-    });
+        false
+    })
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -471,18 +533,126 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == TIMER_SCAN => {
             with_app(|app| {
                 if let Some((m, err)) = app.scan(true) {
-                    balloon(app, &m, err);
+                    if !app.window_visible() || err {
+                        balloon(app, &m, err);
+                    }
                 }
-                tray_update_tip(app);
+                refresh_tray(app);
+            });
+            0
+        }
+        WM_TIMER if wp == TIMER_ANIM => {
+            with_app(|app| {
+                if app.window_visible() {
+                    ui::on_anim_tick(app);
+                } else {
+                    unsafe { KillTimer(hwnd, TIMER_ANIM) };
+                }
             });
             0
         }
         WM_TRAY => {
             match lp as u32 {
-                WM_RBUTTONUP | WM_LBUTTONUP => with_app(show_menu),
-                WM_LBUTTONDBLCLK => with_app(|app| open_folder(app)),
+                WM_RBUTTONUP => {
+                    with_app(show_menu);
+                }
+                WM_LBUTTONUP => {
+                    with_app(show_window);
+                }
                 _ => {}
             }
+            0
+        }
+        WM_SHOW_WINDOW => {
+            with_app(show_window);
+            0
+        }
+        WM_PAINT => {
+            unsafe {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                GetClientRect(hwnd, &mut rc);
+                with_app(|app| {
+                    let src = ui::paint_to(app, rc.right.max(1), rc.bottom.max(1));
+                    BitBlt(hdc, 0, 0, rc.right, rc.bottom, src, 0, 0, SRCCOPY);
+                });
+                EndPaint(hwnd, &ps);
+            }
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_SIZE => {
+            gfx::invalidate(hwnd);
+            0
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| ui::on_mouse_move(app, lp));
+            0
+        }
+        WM_MOUSELEAVE => {
+            with_app(ui::on_mouse_leave);
+            0
+        }
+        WM_LBUTTONDOWN => {
+            with_app(|app| ui::on_button_down(app, lp));
+            0
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| ui::on_button_up(app, lp));
+            0
+        }
+        WM_RBUTTONUP => {
+            with_app(|app| ui::on_right_click(app, lp));
+            0
+        }
+        WM_MOUSEWHEEL => {
+            with_app(|app| ui::on_wheel(app, wp));
+            0
+        }
+        WM_KEYDOWN => {
+            with_app(|app| ui::on_key(app, wp as u16));
+            0
+        }
+        WM_SETCURSOR if (lp & 0xFFFF) as u32 == HTCLIENT => {
+            let mut handled = false;
+            with_app(|app| handled = ui::on_set_cursor(app));
+            if handled { 1 } else { unsafe { DefWindowProcW(hwnd, msg, wp, lp) } }
+        }
+        WM_DROPFILES => {
+            with_app(|app| ui::on_drop(app, wp as HDROP));
+            0
+        }
+        WM_GETMINMAXINFO => {
+            let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+            let info = unsafe { &mut *(lp as *mut MINMAXINFO) };
+            info.ptMinTrackSize = POINT { x: (780.0 * dpi) as i32, y: (520.0 * dpi) as i32 };
+            0
+        }
+        WM_DPICHANGED => {
+            with_app(|app| ui::set_dpi(app, (wp & 0xFFFF) as u32));
+            let r = unsafe { &*(lp as *const RECT) };
+            unsafe {
+                SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE)
+            };
+            0
+        }
+        WM_SETTINGCHANGE | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            with_app(ui::apply_theme);
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_CLOSE => {
+            // Closing the window keeps CursorDrop in the tray (like DS4-Native).
+            unsafe {
+                ShowWindow(hwnd, SW_HIDE);
+                KillTimer(hwnd, TIMER_ANIM);
+            }
+            with_app(|app| {
+                if !app.ui.told_about_tray {
+                    app.ui.told_about_tray = true;
+                    balloon(app, "Still running in the tray - packs dropped into the cursors folder are applied automatically.", false);
+                }
+            });
             0
         }
         WM_DESTROY => {
@@ -498,30 +668,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-fn run_tray() {
+fn run(show: bool) {
     unsafe {
         let mutex_name = wide("Local\\CursorDrop.SingleInstance");
         CreateMutexW(null(), 1, mutex_name.as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let t = wide(APP_NAME);
-            let m = wide("CursorDrop is already running - look for its icon in the system tray.");
-            MessageBoxW(null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            // Already running: bring its window up instead.
+            let class = wide(CLASS_NAME);
+            let other = FindWindowW(class.as_ptr(), null());
+            if !other.is_null() {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(other, &mut pid);
+                windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(pid);
+                PostMessageW(other, WM_SHOW_WINDOW, 0, 0);
+            }
             return;
         }
 
+        gfx::startup();
         let hinst = GetModuleHandleW(null());
-        let class = wide("CursorDropWnd");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinst,
-            lpszClassName: class.as_ptr(),
-            ..std::mem::zeroed()
-        };
-        RegisterClassW(&wc);
-        let title = wide(APP_NAME);
-        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), 0, 0, 0, 0, 0, null_mut(), null_mut(), hinst, null());
-        TASKBAR_CREATED.with(|c| c.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
-
         // The mouse icon from the Mouse control panel; fall back to the generic app icon.
         let cpl = wide("main.cpl");
         let mut icon = ExtractIconW(hinst, cpl.as_ptr(), 0);
@@ -529,22 +694,58 @@ fn run_tray() {
             icon = LoadIconW(null_mut(), IDI_APPLICATION);
         }
 
+        let class = wide(CLASS_NAME);
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinst,
+            lpszClassName: class.as_ptr(),
+            hIcon: icon,
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&wc);
+
+        // Centre a 1100 x 720 (at 96 dpi) client area on the primary screen's work area.
+        let dpi = GetDpiForSystem().max(96);
+        let scale = dpi as f32 / 96.0;
+        let mut rc = RECT { left: 0, top: 0, right: (CLIENT_W * scale) as i32, bottom: (CLIENT_H * scale) as i32 };
+        AdjustWindowRectExForDpi(&mut rc, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+        let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let mut work = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work as *mut RECT).cast(), 0);
+        let x = work.left + ((work.right - work.left) - ww).max(0) / 2;
+        let y = work.top + ((work.bottom - work.top) - wh).max(0) / 2;
+
+        let title = wide(APP_NAME);
+        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, x, y, ww, wh, null_mut(), null_mut(), hinst, null());
+        TASKBAR_CREATED.with(|c| c.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
+        DragAcceptFiles(hwnd, 1);
+
         let mut app = App::new();
         app.hwnd = hwnd;
         app.icon = icon;
+        app.ui.hwnd = hwnd;
+        ui::set_dpi(&mut app, GetDpiForWindow(hwnd).max(96));
+        ui::apply_theme(&mut app);
+        if app.state.ui.on_top {
+            ui::apply_on_top(&app);
+        }
         app.log("started");
         app.startup();
         tray_add(&app);
         let first = app.scan(true);
         if let Some((m, err)) = first {
             balloon(&app, &m, err);
-        } else if app.state.installed.is_empty() {
+        } else if app.state.installed.is_empty() && !show {
             balloon(&app, "Drop a cursor pack (.zip, .7z or .rar) into the cursors folder and it will be applied automatically.", false);
         }
-        tray_update_tip(&app);
+        refresh_tray(&app);
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         SetTimer(hwnd, TIMER_SCAN, SCAN_MS, None);
+        if show {
+            with_app(show_window);
+        }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
@@ -581,7 +782,26 @@ fn inspect(path: &Path) -> i32 {
     code
 }
 
+/// `CURSORDROP_SELFTEST=<folder>`: installs the packs in the cursors folder without applying
+/// them, renders each view to a PNG in <folder> and exits. No window, tray icon or cursor change.
+fn self_test(out: &Path) {
+    gfx::startup();
+    let mut app = App::new();
+    app.no_apply = true;
+    app.scan(false);
+    if let Ok(a) = std::env::var("CURSORDROP_SELFTEST_ACTIVE") {
+        app.state.active = Some(Active { archive: a, scheme: 0 });
+    }
+    let _ = fs::create_dir_all(out);
+    ui::self_test(&mut app, out);
+}
+
 fn main() {
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if let Ok(dir) = std::env::var("CURSORDROP_SELFTEST") {
+        self_test(Path::new(&dir));
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--inspect") if args.len() >= 2 => std::process::exit(inspect(Path::new(&args[1]))),
@@ -595,6 +815,7 @@ fn main() {
                 }
             }
         }
-        _ => run_tray(),
+        Some("--tray") => run(false),
+        _ => run(true),
     }
 }
