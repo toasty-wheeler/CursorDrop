@@ -12,6 +12,8 @@ replace before you use it.
 
 ![The cursors in a pack, now vs. new](docs/cursors.png)
 
+![Dragging a pack onto the window](docs/drop.png)
+
 ## Download
 
 Get `CursorDrop-v1.0.0-win64.zip` from [Releases](../../releases), unzip it anywhere and run
@@ -20,7 +22,8 @@ Get `CursorDrop-v1.0.0-win64.zip` from [Releases](../../releases), unzip it anyw
 ## Using it
 
 - **Add a pack:** put the archive in the `cursors` folder next to `CursorDrop.exe`, click
-  **Add pack…**, or drag it onto the window. It's applied straight away.
+  **Add pack…**, or drag it onto the window (it lights up to show it'll take the pack, or
+  warns if what you're dragging isn't one). It's applied straight away.
 - **See what changes:** click a pack. Each of the 17 Windows cursors is shown as it is now
   and as it would be with the pack; animated `.ani` cursors play.
 - **Variants:** packs with several versions (sizes, colours, characters…) get browser-style
@@ -29,8 +32,9 @@ Get `CursorDrop-v1.0.0-win64.zip` from [Releases](../../releases), unzip it anyw
 - **Undo:** CursorDrop remembers your cursors before it applies a pack. **Restore original
   cursors** brings them back, and so does deleting the pack from the folder (or
   **Remove pack**, which moves it to the Recycle Bin).
-- **Tray:** closing the window keeps CursorDrop in the tray, still watching the folder.
-  **Start with Windows** starts it there at sign-in.
+- **Tray:** with **Close to tray** on (the default), closing the window keeps CursorDrop in
+  the tray, still watching the folder; turn it off and closing the window quits.
+  **Start with Windows** starts it in the tray at sign-in.
 - **Looks:** follows Windows' light/dark setting and accent colour, or pick Light / Dark;
   the pin keeps the window on top.
 

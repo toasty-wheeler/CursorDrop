@@ -7,13 +7,14 @@ scheme. No installer, no admin rights.
 Getting started
 ---------------
 1. Unzip this folder anywhere you like (e.g. Documents\CursorDrop) and run CursorDrop.exe.
-2. Put a cursor pack (.zip, .7z or .rar, as downloaded) into the "cursors" folder, or click
+2. Put a cursor pack (.zip, .7z or .rar, as downloaded) into the "cursors" folder, click
    "Add pack..." in the window, or drag the archive onto the window.
 3. It is applied within a couple of seconds. Click a pack in the list to see every cursor
    it replaces; packs with several variants get tabs to choose from.
 
-Closing the window keeps CursorDrop running in the tray (bottom right). Click the tray icon
-to bring the window back; right-click it for the menu, including Exit.
+With "Close to tray" on (the default), closing the window keeps CursorDrop running in the
+tray (bottom right): click the tray icon to bring the window back, right-click it for the
+menu, including Exit. Turn "Close to tray" off and closing the window quits CursorDrop.
 
 Getting your old cursors back
 -----------------------------

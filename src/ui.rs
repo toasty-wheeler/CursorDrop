@@ -65,6 +65,7 @@ const ROW_H: f32 = 40.0;
 const TILE_MIN_W: f32 = 176.0;
 const TILE_H: f32 = 158.0;
 const TILE_GAP: f32 = 12.0;
+const TOGGLE_W: f32 = 236.0;
 const TAB_MIN: f32 = 150.0;
 const TAB_MAX: f32 = 240.0;
 const TAB_H: f32 = 34.0;
@@ -78,6 +79,8 @@ pub struct UiSettings {
     pub columns: [f32; 5],
     pub sort_column: usize,
     pub sort_ascending: bool,
+    /// Closing the window keeps CursorDrop in the tray; off: closing quits.
+    pub close_to_tray: bool,
 }
 
 impl Default for UiSettings {
@@ -88,6 +91,7 @@ impl Default for UiSettings {
             columns: [290.0, 160.0, 180.0, 90.0, 200.0],
             sort_column: 0,
             sort_ascending: true,
+            close_to_tray: true,
         }
     }
 }
@@ -183,7 +187,14 @@ pub struct Ui {
     theme_open: bool,
     pub dark: bool,
     accent: Color,
-    knob: f32,
+    knobs: [f32; 2],
+    /// Files being dragged over the window (None when nothing is), what the overlay last
+    /// showed (kept while it fades out), and how far it has faded in.
+    drag: Option<DragInfo>,
+    drag_shown: Option<DragInfo>,
+    drag_t: f32,
+    /// Files dropped on the window, handled after the drag finishes (WM_APP + 3).
+    pub dropped: Vec<PathBuf>,
     pub cursors: CursorCache,
     shell: HashMap<String, (HICON, String)>,
     canvas: Option<Canvas>,
@@ -229,7 +240,11 @@ impl Default for Ui {
             theme_open: false,
             dark: false,
             accent: argb(255, 10, 132, 255),
-            knob: -1.0,
+            knobs: [-1.0; 2],
+            drag: None,
+            drag_shown: None,
+            drag_t: 0.0,
+            dropped: vec![],
             cursors: CursorCache::default(),
             shell: HashMap::new(),
             canvas: None,
@@ -416,6 +431,7 @@ struct Model {
     active: Option<Active>,
     startup: bool,
     can_restore: bool,
+    close_to_tray: bool,
     theme: u8,
     on_top: bool,
     columns: [f32; 5],
@@ -453,6 +469,7 @@ impl Model {
             active: if current { app.state.active.clone() } else { None },
             startup: app.startup_enabled(),
             can_restore: current && app.state.backup.is_some(),
+            close_to_tray: s.close_to_tray,
             theme: s.theme,
             on_top: s.on_top,
             columns: s.columns,
@@ -645,14 +662,24 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
     let mut shell = std::mem::take(&mut app.ui.shell);
     let ui = &mut app.ui;
 
-    // Switch knob eases towards its state.
-    let goal = if model.startup { 1.0 } else { 0.0 };
-    if ui.knob < 0.0 {
-        ui.knob = goal;
+    // Switch knobs ease towards their state; the drop overlay fades in and out.
+    for (knob, on) in ui.knobs.iter_mut().zip([model.startup, model.close_to_tray]) {
+        let goal = if on { 1.0 } else { 0.0 };
+        if *knob < 0.0 {
+            *knob = goal;
+        }
+        *knob += (goal - *knob) * 0.3;
+        if (goal - *knob).abs() < 0.01 {
+            *knob = goal;
+        }
     }
-    ui.knob += (goal - ui.knob) * 0.3;
-    if (goal - ui.knob).abs() < 0.01 {
-        ui.knob = goal;
+    let drag_goal = if ui.drag.is_some() { 1.0 } else { 0.0 };
+    ui.drag_t += (drag_goal - ui.drag_t) * 0.28;
+    if (drag_goal - ui.drag_t).abs() < 0.01 {
+        ui.drag_t = drag_goal;
+    }
+    if ui.drag.is_some() {
+        ui.drag_shown = ui.drag.clone();
     }
 
     let mut pt = Painter {
@@ -691,13 +718,13 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
         View::List => {
             draw_list_header(&mut pt, &model, m);
             draw_list(&mut pt, ui, &model, content);
-            draw_list_footer(&mut pt, &model, ui.knob, w, h);
+            draw_list_footer(&mut pt, &model, ui.knobs, w, h);
         }
         View::Detail { archive, variant } => {
             let pack = model.pack(&archive).unwrap();
             let variant = variant.min(pack.inst.schemes.len() - 1);
             draw_detail(&mut pt, ui, &model, pack, variant, content, m);
-            draw_detail_footer(&mut pt, &model, pack, variant, ui.knob, w, h);
+            draw_detail_footer(&mut pt, &model, pack, variant, ui.knobs, w, h);
         }
     }
 
@@ -715,6 +742,11 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
     if ui.theme_open {
         let auto_glyph = if pt.dark { G_MOON } else { G_SUN };
         pt.menu(theme_btn, pt.s(170.0), &THEME_NAMES, &[auto_glyph, G_SUN, G_MOON], model.theme as usize);
+    }
+    if ui.drag_t > 0.0 {
+        if let Some(info) = &ui.drag_shown {
+            draw_drop_overlay(&mut pt, info, ui.drag_t, w, h);
+        }
     }
 
     ui.animated = pt.animated;
@@ -819,7 +851,7 @@ fn draw_list(pt: &mut Painter, ui: &mut Ui, model: &Model, card: R) {
 
     if model.packs.is_empty() {
         let hint = R::new(area.x + area.w / 2.0 - pt.s(220.0), area.y + area.h / 2.0 - pt.s(80.0), pt.s(440.0), pt.s(160.0));
-        pt.g.dashed_round(hint, pt.s(14.0), with_alpha(p.subtext, 120), pt.s(1.5));
+        pt.g.dashed_round(hint, pt.s(14.0), with_alpha(p.subtext, 120), pt.s(1.5), 0.0);
         pt.g.text(G_DROP, &pt.f.title, pt.accent, R::new(hint.x, hint.y + pt.s(26.0), hint.w, pt.s(32.0)), Align::Center, Align::Center);
         pt.g.text("Drop cursor packs here", &pt.f.body, p.text, R::new(hint.x, hint.y + pt.s(70.0), hint.w, pt.s(22.0)), Align::Center, Align::Center);
         pt.g.text(
@@ -905,10 +937,13 @@ fn draw_list(pt: &mut Painter, ui: &mut Ui, model: &Model, card: R) {
     pt.scrollbar(area, ui.scroll, ui.scroll_max);
 }
 
-fn footer_card(pt: &mut Painter, knob: f32, w: f32, h: f32) -> R {
+fn footer_card(pt: &mut Painter, knobs: [f32; 2], close_to_tray: bool, w: f32, h: f32) -> R {
     let footer = R::new(pt.s(MARGIN), h - pt.s(FOOTER_H), w - 2.0 * pt.s(MARGIN), pt.s(FOOTER_H) - pt.s(16.0));
     pt.g.fill_round(footer, pt.s(12.0), pt.p.card);
-    pt.toggle_row(R::new(footer.x, footer.y, pt.s(250.0), footer.h), 0, "Start with Windows", "Waits in the tray", knob);
+    let tw = pt.s(TOGGLE_W);
+    pt.toggle_row(R::new(footer.x, footer.y, tw, footer.h), 0, "Start with Windows", "Waits in the tray", knobs[0]);
+    let detail = if close_to_tray { "Keeps running in the tray" } else { "Closing the window quits" };
+    pt.toggle_row(R::new(footer.x + tw, footer.y, tw, footer.h), 1, "Close to tray", detail, knobs[1]);
     footer
 }
 
@@ -919,7 +954,7 @@ fn footer_buttons(pt: &mut Painter, footer: R, buttons: &[(usize, &str, bool, bo
     for &(id, text, primary, live) in buttons.iter().rev() {
         let bw = (pt.g.measure(text, &pt.f.caption) + pt.s(40.0)).max(pt.s(118.0));
         x -= bw;
-        if x < footer.x + pt.s(260.0) {
+        if x < footer.x + pt.s(2.0 * TOGGLE_W + 10.0) {
             break;
         }
         pt.button(R::new(x, y, bw, pt.s(32.0)), id, text, primary, live);
@@ -927,8 +962,8 @@ fn footer_buttons(pt: &mut Painter, footer: R, buttons: &[(usize, &str, bool, bo
     }
 }
 
-fn draw_list_footer(pt: &mut Painter, model: &Model, knob: f32, w: f32, h: f32) {
-    let footer = footer_card(pt, knob, w, h);
+fn draw_list_footer(pt: &mut Painter, model: &Model, knobs: [f32; 2], w: f32, h: f32) {
+    let footer = footer_card(pt, knobs, model.close_to_tray, w, h);
     footer_buttons(
         pt,
         footer,
@@ -940,8 +975,8 @@ fn draw_list_footer(pt: &mut Painter, model: &Model, knob: f32, w: f32, h: f32) 
     );
 }
 
-fn draw_detail_footer(pt: &mut Painter, model: &Model, pack: &Pack, variant: usize, knob: f32, w: f32, h: f32) {
-    let footer = footer_card(pt, knob, w, h);
+fn draw_detail_footer(pt: &mut Painter, model: &Model, pack: &Pack, variant: usize, knobs: [f32; 2], w: f32, h: f32) {
+    let footer = footer_card(pt, knobs, model.close_to_tray, w, h);
     let in_use = model.active.as_ref() == Some(&Active { archive: pack.inst.archive.clone(), scheme: variant });
     footer_buttons(
         pt,
@@ -1347,7 +1382,11 @@ fn action(app: &mut App, (kind, id): Hit) {
             }
             app.save();
         }
-        Kind::Toggle => app.toggle_startup(),
+        Kind::Toggle if id == 0 => app.toggle_startup(),
+        Kind::Toggle => {
+            app.state.ui.close_to_tray = !app.state.ui.close_to_tray;
+            app.save();
+        }
         Kind::Segment => select_variant(app, id),
         Kind::TabPrev => app.ui.tabs.target = (app.ui.tabs.target - app.ui.tabs.tab_w * 2.0).max(0.0),
         Kind::TabNext => app.ui.tabs.target = (app.ui.tabs.target + app.ui.tabs.tab_w * 2.0).min(app.ui.tabs.max),
@@ -1531,26 +1570,126 @@ pub fn add_packs(app: &mut App, files: &[PathBuf]) {
     invalidate(app.ui.hwnd);
 }
 
+/// WM_DROPFILES (only used if OLE drag and drop couldn't be set up).
 pub fn on_drop(app: &mut App, hdrop: HDROP) {
-    let mut files = Vec::new();
-    unsafe {
-        let n = DragQueryFileW(hdrop, 0xFFFF_FFFF, null_mut(), 0);
-        for i in 0..n {
-            let len = DragQueryFileW(hdrop, i, null_mut(), 0);
-            let mut buf = vec![0u16; len as usize + 1];
-            DragQueryFileW(hdrop, i, buf.as_mut_ptr(), len + 1);
-            files.push(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])));
-        }
-        DragFinish(hdrop);
-    }
+    let files = crate::dragdrop::hdrop_files(hdrop);
+    unsafe { DragFinish(hdrop) };
     add_packs(app, &files);
 }
 
-/// Called ~30 times a second while the window is visible: animates .ani cursors and the switch.
+/// What's being dragged over the window, for the overlay.
+#[derive(Clone)]
+pub struct DragInfo {
+    packs: Vec<String>,
+    others: usize,
+}
+
+impl DragInfo {
+    fn new(files: &[PathBuf]) -> DragInfo {
+        let packs: Vec<String> = files
+            .iter()
+            .filter(|f| crate::archive::is_archive(f))
+            .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        DragInfo { others: files.len() - packs.len(), packs }
+    }
+}
+
+/// From the OLE drop target. Returns whether the drag holds something we'd take.
+pub fn on_drag(app: &mut App, event: crate::dragdrop::DragEvent) -> bool {
+    use crate::dragdrop::DragEvent;
+    let ui = &mut app.ui;
+    let welcome = match event {
+        DragEvent::Enter(files) => {
+            let info = DragInfo::new(&files);
+            let ok = !info.packs.is_empty();
+            ui.drag = Some(info);
+            ui.theme_open = false;
+            ok
+        }
+        DragEvent::Over => ui.drag.as_ref().is_some_and(|d| !d.packs.is_empty()),
+        DragEvent::Leave => {
+            ui.drag = None;
+            false
+        }
+        DragEvent::Drop(files) => {
+            ui.drag = None;
+            // Handled once the drag is over, so a message box can't hold up Explorer's drag.
+            ui.dropped = files;
+            unsafe { PostMessageW(ui.hwnd, crate::WM_DROPPED, 0, 0) };
+            true
+        }
+    };
+    if !ui.hwnd.is_null() {
+        unsafe { SetTimer(ui.hwnd, crate::TIMER_ANIM, crate::ANIM_MS, None) };
+    }
+    invalidate(ui.hwnd);
+    welcome
+}
+
+pub fn take_dropped(app: &mut App) {
+    let files = std::mem::take(&mut app.ui.dropped);
+    if !files.is_empty() {
+        add_packs(app, &files);
+    }
+}
+
+/// The drop overlay: the window dims, a dashed accent border "marches" around it and a card
+/// in the middle bobs a drop icon and says what will happen. `t` fades it in and out.
+fn draw_drop_overlay(pt: &mut Painter, info: &DragInfo, t: f32, w: f32, h: f32) {
+    let p = pt.p;
+    let ease = t * t * (3.0 - 2.0 * t);
+    let fade = |c: Color| with_alpha(c, (alpha(c) as f32 * ease) as i32);
+    let ok = !info.packs.is_empty();
+    let tint = if ok { pt.accent } else { WARNING };
+    let secs = pt.ms as f32 / 1000.0;
+
+    pt.g.fill_round(R::new(0.0, 0.0, w, h), 0.0, fade(with_alpha(p.bg, 215)));
+    pt.g.glow(w / 2.0, h / 2.0, w * 0.45, h * 0.45, fade(with_alpha(tint, if pt.dark { 34 } else { 30 })));
+    let frame = R::new(pt.s(12.0), pt.s(12.0), w - pt.s(24.0), h - pt.s(24.0));
+    pt.g.dashed_round(frame, pt.s(18.0), fade(tint), pt.s(2.5), secs * 6.0);
+
+    // The card rises into place as it fades in.
+    let (cw, ch) = (pt.s(420.0), pt.s(190.0));
+    let card = R::new((w - cw) / 2.0, (h - ch) / 2.0 + (1.0 - ease) * pt.s(24.0), cw, ch);
+    pt.g.fill_round(R::new(card.x, card.y + pt.s(4.0), card.w, card.h), pt.s(18.0), fade(p.shadow));
+    pt.g.fill_round(card, pt.s(18.0), fade(with_alpha(p.card, 255)));
+    pt.g.stroke_round(card, pt.s(18.0), fade(with_alpha(tint, 140)), pt.s(1.5));
+
+    // A bobbing badge with the drop (or warning) glyph.
+    let bob = (secs * std::f32::consts::TAU * 0.9).sin() * pt.s(5.0);
+    let badge = R::new(card.x + card.w / 2.0 - pt.s(30.0), card.y + pt.s(24.0) + bob, pt.s(60.0), pt.s(60.0));
+    pt.g.ellipse(badge.x, badge.y, badge.w, badge.h, fade(with_alpha(tint, 40)));
+    pt.g.text(if ok { G_DROP } else { G_WARNING }, &pt.f.big_icon, fade(tint), badge, Align::Center, Align::Center);
+
+    let (title, detail) = if ok {
+        let title = match info.packs.len() {
+            1 => format!("Drop to add {}", info.packs[0]),
+            n => format!("Drop to add {n} cursor packs"),
+        };
+        let detail = match info.others {
+            0 => "It's copied into the cursors folder and used straight away".to_string(),
+            1 => "1 other file isn't a cursor pack and will be skipped".to_string(),
+            n => format!("{n} other files aren't cursor packs and will be skipped"),
+        };
+        (title, detail)
+    } else {
+        ("That's not a cursor pack".to_string(), "CursorDrop takes .zip, .7z and .rar archives".to_string())
+    };
+    let tr = R::new(card.x + pt.s(20.0), card.y + pt.s(102.0), card.w - pt.s(40.0), pt.s(28.0));
+    pt.g.text(&title, &pt.f.title, fade(p.text), tr, Align::Center, Align::Center);
+    let dr = R::new(card.x + pt.s(20.0), card.y + pt.s(136.0), card.w - pt.s(40.0), pt.s(20.0));
+    pt.g.text(&detail, &pt.f.caption, fade(p.subtext), dr, Align::Center, Align::Center);
+}
+
+/// Called ~30 times a second while the window is visible: animates .ani cursors, switches,
+/// the tab strip and the drop overlay.
 pub fn on_anim_tick(app: &mut App) {
-    let goal = if app.startup_enabled() { 1.0 } else { 0.0 };
+    let goals = [app.startup_enabled(), app.state.ui.close_to_tray];
+    let knobs_moving = app.ui.knobs.iter().zip(goals).any(|(k, on)| (k - if on { 1.0 } else { 0.0 }).abs() > 0.001);
     let tabs_moving = (app.ui.tabs.scroll - app.ui.tabs.target).abs() > 0.01;
-    if app.ui.animated || tabs_moving || (app.ui.knob - goal).abs() > 0.001 {
+    let overlay = app.ui.drag.is_some() || app.ui.drag_t > 0.0;
+    if app.ui.animated || tabs_moving || knobs_moving || overlay {
         invalidate(app.ui.hwnd);
     }
 }
@@ -1653,6 +1792,61 @@ pub fn self_test(app: &mut App, dir: &Path) {
     check("dragging a divider widens the column", (app.state.ui.columns[0] - before - 60.0).abs() < 1.0);
     paint_to(app, w, h);
     app.ui.canvas.as_ref().unwrap().save_png(&dir.join("after-clicks.png").to_string_lossy());
+
+    // Close to tray: on by default, the second footer switch turns it off and on.
+    check("close to tray is on by default", app.state.ui.close_to_tray);
+    click(app, Kind::Toggle, 1);
+    check("its switch turns it off", !app.state.ui.close_to_tray);
+    click(app, Kind::Toggle, 1);
+    check("and on again", app.state.ui.close_to_tray);
+
+    // Dragging over the window: the overlay fades in, and a drop adds the pack.
+    use crate::dragdrop::DragEvent;
+    let source = first.as_ref().map(|a| app.drop_dir.join(a));
+    if let Some(source) = source {
+        let tmp = std::env::temp_dir().join(format!("cursordrop-drag-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let dragged = tmp.join("Dragged Pack.zip");
+        let _ = std::fs::copy(&source, &dragged);
+        let notes = tmp.join("notes.txt");
+        let _ = std::fs::write(&notes, "not a pack");
+        app.state.ui.theme = THEME_DARK;
+        apply_theme(app);
+        go_list(app);
+        let welcome = on_drag(app, DragEvent::Enter(vec![dragged.clone(), notes.clone()]));
+        check("a pack being dragged is welcome", welcome);
+        for _ in 0..12 {
+            paint_to(app, w, h);
+        }
+        check("the overlay fades in", app.ui.drag_t > 0.95);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("drop-overlay.png").to_string_lossy());
+        on_drag(app, DragEvent::Leave);
+        let refused = !on_drag(app, DragEvent::Enter(vec![notes.clone()]));
+        check("a plain file is refused", refused);
+        app.state.ui.theme = THEME_LIGHT;
+        apply_theme(app);
+        for _ in 0..12 {
+            paint_to(app, w, h);
+        }
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("drop-refused.png").to_string_lossy());
+        on_drag(app, DragEvent::Leave);
+        for _ in 0..30 {
+            paint_to(app, w, h);
+        }
+        check("the overlay fades out", app.ui.drag_t == 0.0);
+        on_drag(app, DragEvent::Enter(vec![dragged.clone()]));
+        on_drag(app, DragEvent::Drop(vec![dragged.clone()]));
+        check("a drop is queued until the drag is over", app.ui.dropped.len() == 1 && app.ui.drag.is_none());
+        take_dropped(app);
+        check(
+            "the dropped pack is added, opened and used",
+            app.find("Dragged Pack.zip").is_some_and(|i| !i.schemes.is_empty())
+                && matches!(&app.ui.view, View::Detail { archive, .. } if archive == "Dragged Pack.zip")
+                && app.state.active.as_ref().is_some_and(|a| a.archive == "Dragged Pack.zip"),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        go_list(app);
+    }
 
     // The variant tabs of the pack with the most variants.
     let Some(many) = app.state.installed.iter().max_by_key(|i| i.schemes.len()).filter(|i| i.schemes.len() >= 8).map(|i| i.archive.clone())

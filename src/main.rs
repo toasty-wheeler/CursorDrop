@@ -5,6 +5,7 @@
 
 mod archive;
 mod cursors;
+mod dragdrop;
 mod gfx;
 mod scheme;
 mod ui;
@@ -32,10 +33,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CLASS_NAME: &str = "CursorDropWnd";
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_WINDOW: u32 = WM_APP + 2;
+pub const WM_DROPPED: u32 = WM_APP + 3;
 const TIMER_SCAN: usize = 1;
-const TIMER_ANIM: usize = 2;
+pub const TIMER_ANIM: usize = 2;
 const SCAN_MS: u32 = 2000;
-const ANIM_MS: u32 = 33;
+pub const ANIM_MS: u32 = 33;
 const CLIENT_W: f32 = 1100.0;
 const CLIENT_H: f32 = 720.0;
 
@@ -589,6 +591,13 @@ fn run_command(app: &mut App, cmd: usize) {
     refresh_tray(app);
 }
 
+/// The drop target's events, passed to the window (see dragdrop.rs).
+fn drag_event(event: dragdrop::DragEvent) -> bool {
+    let mut welcome = false;
+    with_app(|app| welcome = ui::on_drag(app, event));
+    welcome
+}
+
 fn with_app(f: impl FnOnce(&mut App)) -> bool {
     APP.with(|a| {
         if let Ok(mut guard) = a.try_borrow_mut() {
@@ -638,6 +647,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SHOW_WINDOW => {
             with_app(show_window);
+            0
+        }
+        WM_DROPPED => {
+            with_app(ui::take_dropped);
             0
         }
         WM_PAINT => {
@@ -703,7 +716,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_GETMINMAXINFO => {
             let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
             let info = unsafe { &mut *(lp as *mut MINMAXINFO) };
-            info.ptMinTrackSize = POINT { x: (780.0 * dpi) as i32, y: (520.0 * dpi) as i32 };
+            info.ptMinTrackSize = POINT { x: (1000.0 * dpi) as i32, y: (520.0 * dpi) as i32 };
             0
         }
         WM_DPICHANGED => {
@@ -719,7 +732,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_CLOSE => {
-            // Closing the window keeps CursorDrop in the tray (like DS4-Native).
+            // With "Close to tray" on (the default) closing keeps CursorDrop in the tray, like
+            // DS4-Native; with it off, closing the window quits.
+            let mut to_tray = true;
+            with_app(|app| to_tray = app.state.ui.close_to_tray);
+            if !to_tray {
+                unsafe { DestroyWindow(hwnd) };
+                return 0;
+            }
             unsafe {
                 ShowWindow(hwnd, SW_HIDE);
                 KillTimer(hwnd, TIMER_ANIM);
@@ -733,6 +753,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DESTROY => {
+            dragdrop::unregister(hwnd);
             with_app(|app| tray_remove(app));
             unsafe { PostQuitMessage(0) };
             0
@@ -800,7 +821,10 @@ fn run(show: bool) {
         let title = wide(APP_NAME);
         let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, x, y, ww, wh, null_mut(), null_mut(), hinst, null());
         TASKBAR_CREATED.with(|c| c.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
-        DragAcceptFiles(hwnd, 1);
+        // OLE drag and drop shows the drop overlay while dragging; WM_DROPFILES is the fallback.
+        if !dragdrop::register(hwnd, drag_event) {
+            DragAcceptFiles(hwnd, 1);
+        }
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
 
         let mut app = App::new();

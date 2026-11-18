@@ -110,6 +110,7 @@ pub struct Fonts {
     pub icon: Font,
     pub glyph: Font,
     pub tiny: Font,
+    pub big_icon: Font,
 }
 
 impl Fonts {
@@ -122,6 +123,7 @@ impl Fonts {
             icon: Font::new("Segoe MDL2 Assets", 15.0 * scale),
             glyph: Font::new("Segoe MDL2 Assets", 10.0 * scale),
             tiny: Font::new("Segoe UI Semibold", 10.0 * scale),
+            big_icon: Font::new("Segoe MDL2 Assets", 28.0 * scale),
         }
     }
 }
@@ -195,12 +197,14 @@ impl Gfx {
         }
     }
 
-    pub fn dashed_round(&self, r: R, radius: f32, c: Color, width: f32) {
+    /// A dashed outline; moving `offset` (in dash lengths) makes the dashes march.
+    pub fn dashed_round(&self, r: R, radius: f32, c: Color, width: f32, offset: f32) {
         let p = round_path(r, radius);
         let mut pen = null_mut();
         unsafe {
             GdipCreatePen1(c, width, UnitPixel, &mut pen);
             GdipSetPenDashStyle(pen, DashStyleDash);
+            GdipSetPenDashOffset(pen, offset);
             GdipDrawPath(self.g, pen, p);
             GdipDeletePen(pen);
             GdipDeletePath(p);
