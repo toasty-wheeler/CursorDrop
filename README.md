@@ -29,7 +29,9 @@ Automatic / Light / Dark theme menu and an always-on-top pin.
   each pack's cursors. Click a column header to sort, drag a divider to resize. Right-click a pack
   for more.
 - **Click a pack** to see a grid of all 17 cursors it replaces, what you have now next to what
-  you'd get (animated `.ani` cursors play). Packs with variants get tabs. From there: use the
+  you'd get (animated `.ani` cursors play). Packs with variants get browser-style tabs: they keep a minimum width and
+  scroll when there are many (arrows at the ends, or the mouse wheel / tilt over them), a
+  hovered tab shows its full name, and Left / Right switch variants. From there: use the
   cursors, show the archive in Explorer, or remove the pack (to the Recycle Bin).
 - **Add pack…** or drag archives onto the window to copy them into the cursors folder.
 - Closing the window keeps CursorDrop in the tray; click the tray icon to bring it back.

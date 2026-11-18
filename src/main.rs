@@ -39,6 +39,7 @@ const CLIENT_W: f32 = 1100.0;
 const CLIENT_H: f32 = 720.0;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const CMD_SHOW: usize = 6;
 const CMD_OPEN: usize = 1;
@@ -305,7 +306,39 @@ impl App {
         note
     }
 
+    /// Re-reads installed packs from their extracted files, so improvements to detection (or
+    /// ordering) reach packs added by an older version. The active variant is kept by name.
+    fn refresh_installed(&mut self) {
+        let active_name = self.active_scheme().map(|s| s.name.clone());
+        for i in 0..self.state.installed.len() {
+            let inst = &self.state.installed[i];
+            if inst.error.is_some() {
+                continue;
+            }
+            let dir = self.scheme_dir(&inst.archive);
+            if !dir.is_dir() {
+                continue;
+            }
+            let stem = Path::new(&inst.archive).file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let schemes = scheme::discover(&dir, &stem);
+            if schemes.is_empty() {
+                continue;
+            }
+            let archive = inst.archive.clone();
+            self.state.installed[i].schemes = schemes;
+            if let (Some(a), Some(name)) = (self.state.active.as_mut(), active_name.as_ref()) {
+                if a.archive == archive {
+                    if let Some(idx) = self.state.installed[i].schemes.iter().position(|s| s.name == *name) {
+                        a.scheme = idx;
+                    }
+                }
+            }
+        }
+        self.save();
+    }
+
     fn startup(&mut self) {
+        self.refresh_installed();
         // If the cursors in use are ours, re-apply so paths stay valid even if the folder moved.
         if let Some(a) = self.state.active.clone() {
             if self.ours_is_current() {
@@ -607,7 +640,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSEWHEEL => {
-            with_app(|app| ui::on_wheel(app, wp));
+            with_app(|app| ui::on_wheel(app, wp, lp, false));
+            0
+        }
+        WM_MOUSEHWHEEL => {
+            with_app(|app| ui::on_wheel(app, wp, lp, true));
             0
         }
         WM_KEYDOWN => {

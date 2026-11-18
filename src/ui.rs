@@ -38,6 +38,8 @@ const G_CHEVRON_UP: &str = "\u{E70E}";
 const G_CHECK: &str = "\u{E73E}";
 const G_DROP: &str = "\u{E896}";
 const G_WARNING: &str = "\u{E7BA}";
+const G_LEFT: &str = "\u{E76B}";
+const G_RIGHT: &str = "\u{E76C}";
 
 pub const THEME_AUTO: u8 = 0;
 pub const THEME_LIGHT: u8 = 1;
@@ -63,6 +65,10 @@ const ROW_H: f32 = 40.0;
 const TILE_MIN_W: f32 = 176.0;
 const TILE_H: f32 = 158.0;
 const TILE_GAP: f32 = 12.0;
+const TAB_MIN: f32 = 150.0;
+const TAB_MAX: f32 = 240.0;
+const TAB_H: f32 = 34.0;
+const TAB_ARROW: f32 = 34.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,6 +110,8 @@ enum Kind {
     Toggle,
     Button,
     Segment,
+    TabPrev,
+    TabNext,
     Tile,
     Thumb,
 }
@@ -183,6 +191,23 @@ pub struct Ui {
     row_order: Vec<String>,
     animated: bool,
     pub told_about_tray: bool,
+    mouse: Option<(f32, f32)>,
+    tabs: TabStrip,
+}
+
+/// The variant tabs: browser-style, with a minimum width; when they don't fit they scroll
+/// (arrows at the ends, or the mouse wheel over them) and ease towards `target`.
+#[derive(Default)]
+struct TabStrip {
+    scroll: f32,
+    target: f32,
+    max: f32,
+    /// Where the strip is (for the wheel) and one tab's width (the arrows' step).
+    area: R,
+    tab_w: f32,
+    /// Bring the selected tab into view on the next paint; `snap` skips the easing.
+    reveal: bool,
+    snap: bool,
 }
 
 impl Default for Ui {
@@ -212,6 +237,8 @@ impl Default for Ui {
             row_order: vec![],
             animated: false,
             told_about_tray: false,
+            tabs: TabStrip::default(),
+            mouse: None,
         }
     }
 }
@@ -536,23 +563,13 @@ impl Painter<'_> {
         }
     }
 
-    fn segmented(&mut self, r: R, labels: &[String], selected: usize) {
+    /// A small square arrow button at the end of the tab strip.
+    fn tab_arrow(&mut self, r: R, kind: Kind, glyph: &str, live: bool) {
         let p = self.p;
-        self.g.fill_round(r, self.s(9.0), p.segment);
-        let w = r.w / labels.len() as f32;
-        for (i, label) in labels.iter().enumerate() {
-            let seg = R::new(r.x + w * i as f32, r.y, w, r.h);
-            let hovered = self.add(Kind::Segment, i, seg);
-            let pill = seg.inset(self.s(2.0), self.s(2.0));
-            if i == selected {
-                self.g.fill_round(R::new(pill.x, pill.y + self.s(1.0), pill.w, pill.h), self.s(7.0), p.shadow);
-                self.g.fill_round(pill, self.s(7.0), p.segment_on);
-            } else if hovered {
-                self.g.fill_round(pill, self.s(7.0), with_alpha(p.segment_on, 110));
-            }
-            let font = if i == selected { &self.f.section } else { &self.f.caption };
-            self.g.text(label, font, p.text, seg.inset(self.s(6.0), 0.0), Align::Center, Align::Center);
-        }
+        let hovered = live && self.add(kind, 0, r);
+        self.g.fill_round(r, self.s(9.0), if hovered { p.segment_on } else { p.segment });
+        let c = if live { p.text } else { with_alpha(p.text, 70) };
+        self.g.text(glyph, &self.f.glyph, c, r, Align::Center, Align::Center);
     }
 
     fn section_label(&self, x: f32, y: f32, w: f32, text: &str) {
@@ -698,6 +715,16 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
 
     ui.animated = pt.animated;
     ui.elems = std::mem::take(&mut pt.elems);
+    // Things can move under a still mouse (the tabs ease along): keep the hover honest.
+    if let Some((x, y)) = ui.mouse {
+        if ui.col_drag.is_none() && ui.thumb_drag.is_none() {
+            let hit = hit_test(ui, x, y);
+            if hit != ui.hover {
+                ui.hover = hit;
+                invalidate(ui.hwnd);
+            }
+        }
+    }
     drop(pt);
     app.ui.fonts = Some(fonts);
     app.ui.cursors = cursors;
@@ -904,6 +931,95 @@ fn draw_detail_footer(pt: &mut Painter, model: &Model, pack: &Pack, variant: usi
     );
 }
 
+/// Browser-style tabs for a pack's variants. They share the row up to TAB_MAX each; below
+/// TAB_MIN they stop shrinking and the strip scrolls instead, with arrows at both ends. A
+/// hovered tab whose name doesn't fit grows over its neighbours to show all of it.
+fn draw_tabs(pt: &mut Painter, t: &mut TabStrip, r: R, labels: &[String], selected: usize) {
+    let p = pt.p;
+    let n = labels.len() as f32;
+    let fits = n * pt.s(TAB_MIN) <= r.w;
+    let (view, tab_w) = if fits {
+        let tw = (r.w / n).min(pt.s(TAB_MAX));
+        (R::new(r.x, r.y, tw * n, r.h), tw)
+    } else {
+        let a = pt.s(TAB_ARROW + 6.0);
+        (R::new(r.x + a, r.y, r.w - 2.0 * a, r.h), pt.s(TAB_MIN))
+    };
+    t.area = if fits { view } else { r };
+    t.tab_w = tab_w;
+    t.max = (tab_w * n - view.w).max(0.0);
+
+    // Keep the selected tab in view; ease the scroll towards its target.
+    if t.reveal {
+        let (x0, x1) = (selected as f32 * tab_w, (selected + 1) as f32 * tab_w);
+        if x0 < t.target {
+            t.target = x0;
+        } else if x1 > t.target + view.w {
+            t.target = x1 - view.w;
+        }
+        t.reveal = false;
+    }
+    t.target = t.target.clamp(0.0, t.max);
+    if t.snap {
+        t.scroll = t.target;
+        t.snap = false;
+    } else {
+        t.scroll += (t.target - t.scroll) * 0.35;
+        if (t.target - t.scroll).abs() < 0.5 {
+            t.scroll = t.target;
+        }
+    }
+    t.scroll = t.scroll.clamp(0.0, t.max);
+
+    if !fits {
+        let left = R::new(r.x, r.y, pt.s(TAB_ARROW), r.h);
+        let right = R::new(r.right() - pt.s(TAB_ARROW), r.y, pt.s(TAB_ARROW), r.h);
+        pt.tab_arrow(left, Kind::TabPrev, G_LEFT, t.target > 0.5);
+        pt.tab_arrow(right, Kind::TabNext, G_RIGHT, t.target < t.max - 0.5);
+    }
+    pt.g.fill_round(view, pt.s(9.0), p.segment);
+    pt.g.clip(view);
+    let mut grow: Option<(usize, R)> = None;
+    for (i, label) in labels.iter().enumerate() {
+        let seg = R::new(view.x + i as f32 * tab_w - t.scroll, view.y, tab_w, view.h);
+        if seg.right() <= view.x || seg.x >= view.right() {
+            continue;
+        }
+        let vx = seg.x.max(view.x);
+        let visible = R::new(vx, seg.y, seg.right().min(view.right()) - vx, seg.h);
+        let hovered = pt.add(Kind::Segment, i, visible);
+        let pill = seg.inset(pt.s(2.0), pt.s(2.0));
+        if i == selected {
+            pt.g.fill_round(R::new(pill.x, pill.y + pt.s(1.0), pill.w, pill.h), pt.s(7.0), p.shadow);
+            pt.g.fill_round(pill, pt.s(7.0), p.segment_on);
+        } else if hovered {
+            pt.g.fill_round(pill, pt.s(7.0), with_alpha(p.segment_on, 110));
+        } else if i + 1 < labels.len() && i + 1 != selected {
+            // A thin divider between neighbouring unselected tabs, like a browser's.
+            let x = seg.right();
+            pt.g.line(x, seg.y + pt.s(10.0), x, seg.bottom() - pt.s(10.0), with_alpha(p.subtext, 60), pt.s(1.0));
+        }
+        let font = if i == selected { &pt.f.section } else { &pt.f.caption };
+        let text_r = seg.inset(pt.s(12.0), 0.0);
+        pt.g.text(label, font, p.text, text_r, Align::Center, Align::Center);
+        if hovered && pt.g.measure(label, font) > text_r.w {
+            grow = Some((i, seg));
+        }
+    }
+    if let Some((i, seg)) = grow {
+        let font = if i == selected { &pt.f.section } else { &pt.f.caption };
+        let w = (pt.g.measure(&labels[i], font) + pt.s(28.0)).min(view.w);
+        let x = (seg.x + seg.w / 2.0 - w / 2.0).clamp(view.x, view.right() - w);
+        let pill = R::new(x, seg.y + pt.s(2.0), w, seg.h - pt.s(4.0));
+        pt.g.fill_round(R::new(pill.x, pill.y + pt.s(2.0), pill.w, pill.h), pt.s(7.0), p.shadow);
+        let fill = if i == selected { p.segment_on } else { mix(p.segment, p.segment_on, 0.45) };
+        pt.g.fill_round(pill, pt.s(7.0), with_alpha(fill, 255));
+        pt.g.stroke_round(pill, pt.s(7.0), p.line, pt.s(1.0));
+        pt.g.text(&labels[i], font, p.text, pill.inset(pt.s(10.0), 0.0), Align::Center, Align::Center);
+    }
+    pt.g.unclip();
+}
+
 fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, variant: usize, content: R, m: f32) {
     let p = pt.p;
     let scheme = &pack.inst.schemes[variant];
@@ -926,9 +1042,11 @@ fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, varian
     let mut top = content.y;
     if pack.inst.schemes.len() > 1 {
         let labels: Vec<String> = pack.inst.schemes.iter().map(|s| s.name.clone()).collect();
-        let w = (pt.s(160.0) * labels.len() as f32).min(content.w);
-        pt.segmented(R::new(content.x, top, w, pt.s(34.0)), &labels, variant);
-        top += pt.s(46.0);
+        draw_tabs(pt, &mut ui.tabs, R::new(content.x, top, content.w, pt.s(TAB_H)), &labels, variant);
+        top += pt.s(TAB_H + 12.0);
+    } else {
+        ui.tabs.area = R::default();
+        ui.tabs.max = 0.0;
     }
     let current = current_cursors();
     let changes = (0..ROLES.len())
@@ -1019,6 +1137,7 @@ fn mouse_pos(lp: LPARAM) -> (f32, f32) {
 pub fn on_mouse_move(app: &mut App, lp: LPARAM) {
     let (x, y) = mouse_pos(lp);
     let ui = &mut app.ui;
+    ui.mouse = Some((x, y));
     if !ui.tracking {
         let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: ui.hwnd, dwHoverTime: 0 };
         unsafe { TrackMouseEvent(&mut tme) };
@@ -1048,6 +1167,7 @@ pub fn on_mouse_move(app: &mut App, lp: LPARAM) {
 
 pub fn on_mouse_leave(app: &mut App) {
     app.ui.tracking = false;
+    app.ui.mouse = None;
     if app.ui.hover.is_some() && app.ui.col_drag.is_none() {
         app.ui.hover = None;
         invalidate(app.ui.hwnd);
@@ -1110,11 +1230,31 @@ pub fn on_right_click(app: &mut App, lp: LPARAM) {
     }
 }
 
-pub fn on_wheel(app: &mut App, wp: WPARAM) {
+/// WM_MOUSEWHEEL / WM_MOUSEHWHEEL. Over the variant tabs either wheel scrolls them sideways
+/// (wheel down / tilt right = forwards); elsewhere the vertical wheel scrolls the list or grid.
+pub fn on_wheel(app: &mut App, wp: WPARAM, lp: LPARAM, horizontal: bool) {
     let delta = ((wp >> 16) & 0xFFFF) as i16 as f32;
     let ui = &mut app.ui;
-    ui.scroll = (ui.scroll - delta / 120.0 * 72.0 * ui.scale).clamp(0.0, ui.scroll_max);
+    let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+    if !ui.hwnd.is_null() {
+        unsafe { ScreenToClient(ui.hwnd, &mut pt) };
+    }
+    let tabs = &mut ui.tabs;
+    if tabs.max > 0.0 && tabs.area.contains(pt.x as f32, pt.y as f32) {
+        let step = delta / 120.0 * tabs.tab_w * 0.8;
+        tabs.target = (tabs.target + if horizontal { step } else { -step }).clamp(0.0, tabs.max);
+    } else if !horizontal {
+        ui.scroll = (ui.scroll - delta / 120.0 * 72.0 * ui.scale).clamp(0.0, ui.scroll_max);
+    }
     invalidate(ui.hwnd);
+}
+
+fn select_variant(app: &mut App, v: usize) {
+    if let View::Detail { archive, variant } = &mut app.ui.view {
+        let count = app.state.installed.iter().find(|i| i.archive == *archive).map_or(1, |i| i.schemes.len());
+        *variant = v.min(count.saturating_sub(1));
+        app.ui.tabs.reveal = true;
+    }
 }
 
 pub fn on_key(app: &mut App, vk: u16) {
@@ -1122,6 +1262,13 @@ pub fn on_key(app: &mut App, vk: u16) {
         app.ui.theme_open = false;
     } else if (vk == VK_ESCAPE || vk == VK_BACK) && app.ui.view != View::List {
         go_list(app);
+    } else if let View::Detail { variant, .. } = app.ui.view {
+        // Left / right arrows step through a pack's variants.
+        if vk == VK_LEFT && variant > 0 {
+            select_variant(app, variant - 1);
+        } else if vk == VK_RIGHT {
+            select_variant(app, variant + 1);
+        }
     }
     invalidate(app.ui.hwnd);
 }
@@ -1143,6 +1290,7 @@ pub fn open_detail(app: &mut App, archive: &str) {
     };
     app.ui.view = View::Detail { archive: archive.to_string(), variant };
     app.ui.scroll = 0.0;
+    app.ui.tabs = TabStrip { reveal: true, snap: true, ..TabStrip::default() };
     app.ui.hover = None;
 }
 
@@ -1177,11 +1325,9 @@ fn action(app: &mut App, (kind, id): Hit) {
             app.save();
         }
         Kind::Toggle => app.toggle_startup(),
-        Kind::Segment => {
-            if let View::Detail { variant, .. } = &mut app.ui.view {
-                *variant = id;
-            }
-        }
+        Kind::Segment => select_variant(app, id),
+        Kind::TabPrev => app.ui.tabs.target = (app.ui.tabs.target - app.ui.tabs.tab_w * 2.0).max(0.0),
+        Kind::TabNext => app.ui.tabs.target = (app.ui.tabs.target + app.ui.tabs.tab_w * 2.0).min(app.ui.tabs.max),
         Kind::Button => button(app, id),
         _ => {}
     }
@@ -1380,7 +1526,8 @@ pub fn on_drop(app: &mut App, hdrop: HDROP) {
 /// Called ~30 times a second while the window is visible: animates .ani cursors and the switch.
 pub fn on_anim_tick(app: &mut App) {
     let goal = if app.startup_enabled() { 1.0 } else { 0.0 };
-    if app.ui.animated || (app.ui.knob - goal).abs() > 0.001 {
+    let tabs_moving = (app.ui.tabs.scroll - app.ui.tabs.target).abs() > 0.01;
+    if app.ui.animated || tabs_moving || (app.ui.knob - goal).abs() > 0.001 {
         invalidate(app.ui.hwnd);
     }
 }
@@ -1451,7 +1598,7 @@ pub fn self_test(app: &mut App, dir: &Path) {
     click(app, Kind::Row, row);
     check("click row opens its cursors", matches!(&app.ui.view, View::Detail { archive, .. } if Some(archive) == first.as_ref()));
     paint_to(app, w, h);
-    on_wheel(app, (-240i32 as u32 as usize) << 16);
+    on_wheel(app, (-240i32 as u32 as usize) << 16, 0, false);
     paint_to(app, w, h);
     check("wheel scrolls the grid", app.ui.scroll > 0.0);
     paint_to(app, w, h);
@@ -1483,4 +1630,66 @@ pub fn self_test(app: &mut App, dir: &Path) {
     check("dragging a divider widens the column", (app.state.ui.columns[0] - before - 60.0).abs() < 1.0);
     paint_to(app, w, h);
     app.ui.canvas.as_ref().unwrap().save_png(&dir.join("after-clicks.png").to_string_lossy());
+
+    // The variant tabs of the pack with the most variants.
+    let Some(many) = app.state.installed.iter().max_by_key(|i| i.schemes.len()).filter(|i| i.schemes.len() >= 8).map(|i| i.archive.clone())
+    else {
+        println!("tabs: skipped (no pack with 8+ variants)");
+        return;
+    };
+    app.state.ui.theme = THEME_DARK;
+    apply_theme(app);
+    open_detail(app, &many);
+    let settle = |app: &mut App| {
+        for _ in 0..40 {
+            paint_to(app, w, h);
+        }
+    };
+    settle(app);
+    check("too many tabs overflow and scroll", app.ui.tabs.max > 0.0 && app.ui.tabs.scroll == 0.0);
+    check("tabs keep their minimum width", app.ui.tabs.tab_w >= TAB_MIN * app.ui.scale - 0.5);
+    app.ui.canvas.as_ref().unwrap().save_png(&dir.join("tabs-start.png").to_string_lossy());
+    let over = |app: &App| {
+        let a = app.ui.tabs.area;
+        let (x, y) = ((a.x + a.w / 2.0) as i32, (a.y + a.h / 2.0) as i32);
+        ((y as u32 as isize) << 16) | (x as u16 as isize)
+    };
+    let down = (-120i32 as u32 as usize) << 16;
+    let grid_before = app.ui.scroll;
+    on_wheel(app, down, over(app), false);
+    settle(app);
+    check("wheel down over the tabs scrolls them forwards", app.ui.tabs.scroll > 0.0 && app.ui.scroll == grid_before);
+    let s1 = app.ui.tabs.scroll;
+    on_wheel(app, 120usize << 16, over(app), true);
+    settle(app);
+    check("tilting right scrolls further", app.ui.tabs.scroll > s1);
+    let s2 = app.ui.tabs.scroll;
+    click(app, Kind::TabPrev, 0);
+    settle(app);
+    check("left arrow scrolls back", app.ui.tabs.scroll < s2);
+    for _ in 0..50 {
+        click(app, Kind::TabNext, 0);
+    }
+    settle(app);
+    check("right arrow reaches the end", (app.ui.tabs.scroll - app.ui.tabs.max).abs() < 0.5);
+    app.ui.canvas.as_ref().unwrap().save_png(&dir.join("tabs-end.png").to_string_lossy());
+    on_key(app, VK_RIGHT);
+    settle(app);
+    check("right key picks the next variant and scrolls back to it", matches!(app.ui.view, View::Detail { variant: 1, .. }) && app.ui.tabs.scroll < app.ui.tabs.max);
+    on_key(app, VK_LEFT);
+    settle(app);
+    check("left key picks the previous variant and scrolls to it", matches!(app.ui.view, View::Detail { variant: 0, .. }) && app.ui.tabs.scroll == 0.0);
+    // Hover a tab whose name is cut off: it grows to show the full name.
+    paint_to(app, w, h);
+    if let Some(e) = app.ui.elems.iter().find(|e| e.kind == Kind::Segment && e.id == 2) {
+        let (x, y) = ((e.r.x + e.r.w / 2.0) as i32, (e.r.y + e.r.h / 2.0) as i32);
+        on_mouse_move(app, ((y as u32 as isize) << 16) | (x as u16 as isize));
+    }
+    paint_to(app, w, h);
+    check("hovering a tab", app.ui.hover == Some((Kind::Segment, 2)));
+    app.ui.canvas.as_ref().unwrap().save_png(&dir.join("tabs-hover.png").to_string_lossy());
+    app.state.ui.theme = THEME_LIGHT;
+    apply_theme(app);
+    paint_to(app, w, h);
+    app.ui.canvas.as_ref().unwrap().save_png(&dir.join("tabs-hover-light.png").to_string_lossy());
 }

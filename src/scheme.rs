@@ -39,10 +39,38 @@ fn is_cursor(p: &Path) -> bool {
     )
 }
 
+/// Compares names the way Explorer sorts them: case-insensitive, numbers by value ("v2" < "v10").
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn chunks(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for c in s.chars() {
+            let digit = c.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, text)) if *d == digit => text.push(c),
+                _ => out.push((digit, c.to_string())),
+            }
+        }
+        out
+    }
+    let (ca, cb) = (chunks(a), chunks(b));
+    for ((da, ta), (db, tb)) in ca.iter().zip(cb.iter()) {
+        let o = if *da && *db {
+            let (na, nb) = (ta.trim_start_matches('0'), tb.trim_start_matches('0'));
+            na.len().cmp(&nb.len()).then_with(|| na.cmp(nb))
+        } else {
+            ta.to_lowercase().cmp(&tb.to_lowercase())
+        };
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    ca.len().cmp(&cb.len())
+}
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-    entries.sort();
+    entries.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
     for p in entries {
         if p.is_dir() {
             walk(&p, out);
@@ -449,6 +477,13 @@ link          = "Link.ani"
         assert_eq!(files[7].as_deref(), Some("Unavailable.cur"));
         assert_eq!(files[14].as_deref(), Some("Link.ani"));
         assert!(files[15].is_none());
+    }
+
+    #[test]
+    fn natural_order() {
+        let mut v = vec!["v10", "v2", "V1", "v0", "Dark 12", "Dark 3"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, ["Dark 3", "Dark 12", "v0", "V1", "v2", "v10"]);
     }
 
     #[test]
