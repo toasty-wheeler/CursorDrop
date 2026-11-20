@@ -1,6 +1,6 @@
 [package]
 name = "cursor-drop"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Windows tray app that applies mouse-cursor packs (.zip, .7z, .rar) dropped into its cursors folder"
 license = "MIT"

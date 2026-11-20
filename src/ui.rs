@@ -2863,6 +2863,7 @@ pub fn self_test(app: &mut App, dir: &Path) {
         paint_to(app, w, h);
         app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-special.png").to_string_lossy());
         click(app, Kind::QuickSel, 0);
+        app.ui.sched.list_scroll = 0.0;
         paint_to(app, w, h);
         app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-light.png").to_string_lossy());
         click(app, Kind::Toggle, 2);

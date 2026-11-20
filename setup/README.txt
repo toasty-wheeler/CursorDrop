@@ -14,6 +14,9 @@ Getting started
    Click any cursor there to pick a different one (from the pack, another pack, or keep
    yours). "Current cursors", first in the list, lets you mix your own set and save it
    as a preset.
+   The Schedule button sets cursors per day: weeks of the month (Weekdays, Weekends...)
+   and special dates like holidays, with one set, a random pick, or random from all.
+   Turn on "Follow the schedule" to use it.
 
 With "Close to tray" on (the default), closing the window keeps CursorDrop running in the
 tray (bottom right): click the tray icon to bring the window back, right-click it for the

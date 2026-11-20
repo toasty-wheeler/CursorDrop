@@ -16,6 +16,8 @@ replace before you use it.
 
 ![Choosing a different cursor for one slot](docs/picker.png)
 
+![The schedule: weeks of the month and special days](docs/schedule.png)
+
 ![Dragging a pack onto the window](docs/drop.png)
 
 ## Download
