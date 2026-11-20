@@ -6,6 +6,7 @@
 mod archive;
 mod cursors;
 mod dragdrop;
+mod edit;
 mod gfx;
 mod scheme;
 mod ui;
@@ -26,6 +27,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Shell::*;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const APP_NAME: &str = "CursorDrop";
@@ -62,11 +64,20 @@ struct State {
     /// Extraction / naming version the installed packs were made with (see FORMAT).
     #[serde(default)]
     format: u32,
+    /// Cursors chosen by hand on pack variants (see edit.rs), keyed "archive{1}variant".
+    #[serde(default)]
+    overrides: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, edit::Pick>>,
+    /// Changes made on "Current cursors", waiting to be saved as a preset.
+    #[serde(default)]
+    current_draft: std::collections::BTreeMap<usize, edit::Pick>,
+    #[serde(default)]
+    presets: Vec<edit::Preset>,
 }
 
 /// Bump when extraction or scheme naming changes: installed packs are then re-extracted once.
 /// 2: archives inside archives, UTF-8 zip names, short variant labels.
-const FORMAT: u32 = 2;
+/// 3: more file names recognised (accuracy, stop, width, ne/nw, "<name>" = normal pointer).
+const FORMAT: u32 = 3;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Installed {
@@ -77,10 +88,13 @@ pub struct Installed {
     pub error: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// What CursorDrop applied: a pack's variant, or a preset (then `archive` is empty).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Active {
     pub archive: String,
     pub scheme: usize,
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 pub struct App {
@@ -103,7 +117,7 @@ thread_local! {
 }
 
 /// Where the cursors and data folders live: next to the exe (portable), or, if that folder
-/// can't be written to (e.g. Program Files), %LOCALAPPDATA%CursorDrop.
+/// can't be written to (e.g. Program Files), %LOCALAPPDATA%\CursorDrop.
 fn base_dir(exe: &Path) -> PathBuf {
     let here = exe.parent().unwrap().to_path_buf();
     let probe = here.join(".cursordrop-write-test");
@@ -170,16 +184,20 @@ impl App {
         self.state.installed.iter().find(|i| i.archive == archive)
     }
 
+    /// The pack scheme in use (None for presets).
     fn active_scheme(&self) -> Option<&Scheme> {
         let a = self.state.active.as_ref()?;
+        if a.preset.is_some() {
+            return None;
+        }
         self.find(&a.archive)?.schemes.get(a.scheme)
     }
 
     /// True if the cursors Windows is using right now are the scheme we applied.
     pub fn ours_is_current(&self) -> bool {
-        match self.active_scheme() {
+        match self.active_name() {
             Some(_) if self.no_apply => true,
-            Some(s) => cursors::current_scheme_name().is_some_and(|n| n == s.name),
+            Some(name) => cursors::current_scheme_name().is_some_and(|n| n == name),
             None => false,
         }
     }
@@ -192,26 +210,34 @@ impl App {
     /// `may_back_up`: false when the cursors in use are known to be ours already (even if
     /// their scheme name changed), so they never get saved as the "original" cursors.
     fn apply_inner(&mut self, target: Active, may_back_up: bool) -> Result<String, String> {
-        let inst = self.find(&target.archive).ok_or("archive not installed")?;
-        let scheme = inst.schemes.get(target.scheme).ok_or("no such scheme")?.clone();
-        let dir = self.scheme_dir(&target.archive);
-        let paths: Vec<Option<String>> = scheme
-            .files
-            .iter()
-            .map(|f| f.as_ref().map(|rel| dir.join(rel).to_string_lossy().to_string()))
-            .collect();
+        // Windows' name for it, and what the user sees.
+        let (name, shown) = match &target.preset {
+            Some(id) => {
+                let p = self.preset(id).ok_or("preset not found")?;
+                (p.name.clone(), p.name.clone())
+            }
+            None => {
+                let inst = self.find(&target.archive).ok_or("archive not installed")?;
+                let scheme = inst.schemes.get(target.scheme).ok_or("no such scheme")?;
+                (scheme.name.clone(), scheme.display().to_string())
+            }
+        };
+        // The pack's own cursors with whatever was chosen by hand ("keep" slots keep what
+        // Windows has now, so they are read before anything changes).
+        let paths = self.sheet_paths(&target.sheet());
         if !self.no_apply {
             if may_back_up && !self.ours_is_current() {
                 // Remember what the user had so "Restore original cursors" can bring it back.
                 self.state.backup = Some(cursors::take_backup());
             }
-            cursors::apply(&scheme.name, &paths)?;
+            cursors::apply(&name, &paths)?;
         }
         self.state.active = Some(target);
         self.save();
-        self.log(&format!("applied '{}' ({} of {} cursors)", scheme.name, scheme.mapped(), ROLES.len()));
+        let n = paths.iter().filter(|p| p.is_some()).count();
+        self.log(&format!("applied '{name}' ({n} of {} cursors)", ROLES.len()));
         gfx::invalidate(self.ui.hwnd);
-        Ok(scheme.display().to_string())
+        Ok(shown)
     }
 
     pub fn restore(&mut self) -> Result<(), String> {
@@ -284,6 +310,7 @@ impl App {
             }
             let _ = fs::remove_dir_all(self.scheme_dir(&inst.archive));
             self.state.installed.retain(|i| i.archive != inst.archive);
+            self.forget_overrides(&inst.archive);
             self.log(&format!("removed {}", inst.archive));
             self.save();
         }
@@ -310,7 +337,7 @@ impl App {
                 }
                 None => {
                     self.log(&format!("installed {name}: {} scheme(s)", inst.schemes.len()));
-                    to_apply = Some(Active { archive: name.clone(), scheme: 0 });
+                    to_apply = Some(Active::pack(&name, 0));
                 }
             }
             if !self.no_apply {
@@ -318,6 +345,8 @@ impl App {
                     cursors::unregister_scheme(&old.name);
                 }
             }
+            // A changed archive may have different files: hand-picked cursors start over.
+            self.forget_overrides(&name);
             self.state.installed.retain(|i| i.archive != name);
             self.state.installed.push(inst);
             self.save();
@@ -365,7 +394,7 @@ impl App {
                         .position(|s| s.name == was.name)
                         .or_else(|| fresh.schemes.iter().position(|s| s.display() == was.display()))
                         .unwrap_or(a.scheme);
-                    self.state.active = Some(Active { archive: a.archive.clone(), scheme: idx });
+                    self.state.active = Some(Active::pack(&a.archive, idx));
                 }
             }
             if let Some(slot) = self.state.installed.iter_mut().find(|i| i.archive == inst.archive) {
@@ -447,8 +476,8 @@ fn tray_add(app: &App) {
 }
 
 fn tooltip(app: &App) -> String {
-    match app.active_scheme() {
-        Some(s) if app.ours_is_current() => format!("{APP_NAME} - {}", s.display()),
+    match app.active_display() {
+        Some(s) if app.ours_is_current() => format!("{APP_NAME} - {s}"),
         _ => format!("{APP_NAME} - drop cursor packs into the cursors folder"),
     }
 }
@@ -508,7 +537,7 @@ fn show_menu(app: &mut App) {
             }
             let target = if inst.schemes.len() == 1 { menu } else { CreatePopupMenu() };
             for (i, s) in inst.schemes.iter().enumerate() {
-                let t = Active { archive: inst.archive.clone(), scheme: i };
+                let t = Active::pack(&inst.archive, i);
                 let checked = if active.as_ref() == Some(&t) { MF_CHECKED } else { MF_UNCHECKED };
                 let label = if s.mapped() < ROLES.len() {
                     format!("{}   ({}/{})", s.display(), s.mapped(), ROLES.len())
@@ -522,6 +551,17 @@ fn show_menu(app: &mut App) {
                 let w = wide(&inst.archive.replace('&', "&&"));
                 AppendMenuW(menu, MF_POPUP, target as usize, w.as_ptr());
             }
+        }
+        let presets = app.state.presets.clone();
+        if !presets.is_empty() {
+            append(menu, MF_SEPARATOR, 0, "");
+            append(menu, MF_STRING | MF_GRAYED, 0, "Presets");
+        }
+        for p in &presets {
+            let t = Active::preset(&p.id);
+            let checked = if active.as_ref() == Some(&t) { MF_CHECKED } else { MF_UNCHECKED };
+            append(menu, MF_STRING | checked, CMD_SCHEME_BASE + app.menu_map.len(), &p.name);
+            app.menu_map.push(t);
         }
 
         append(menu, MF_SEPARATOR, 0, "");
@@ -662,12 +702,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 with_app(|app| {
                     let src = ui::paint_to(app, rc.right.max(1), rc.bottom.max(1));
                     BitBlt(hdc, 0, 0, rc.right, rc.bottom, src, 0, 0, SRCCOPY);
+                    ui::place_dialog_edit(app);
                 });
                 EndPaint(hwnd, &ps);
             }
             0
         }
         WM_ERASEBKGND => 1,
+        WM_CTLCOLOREDIT => {
+            let mut brush = 0;
+            with_app(|app| brush = ui::edit_colours(app, wp as HDC));
+            if brush != 0 { brush } else { unsafe { DefWindowProcW(hwnd, msg, wp, lp) } }
+        }
         WM_SIZE => {
             gfx::invalidate(hwnd);
             0
@@ -819,7 +865,7 @@ fn run(show: bool) {
         let y = work.top + ((work.bottom - work.top) - wh).max(0) / 2;
 
         let title = wide(APP_NAME);
-        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, x, y, ww, wh, null_mut(), null_mut(), hinst, null());
+        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, ww, wh, null_mut(), null_mut(), hinst, null());
         TASKBAR_CREATED.with(|c| c.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
         // OLE drag and drop shows the drop overlay while dragging; WM_DROPFILES is the fallback.
         if !dragdrop::register(hwnd, drag_event) {
@@ -854,6 +900,12 @@ fn run(show: bool) {
         }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            // Enter and Esc in the preset name box confirm / cancel the dialog.
+            if msg.message == WM_KEYDOWN && !msg.hwnd.is_null() && msg.hwnd == ui::name_edit() && (msg.wParam == VK_RETURN as usize || msg.wParam == VK_ESCAPE as usize) {
+                let vk = msg.wParam as u16;
+                with_app(|app| ui::on_dialog_key(app, vk));
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -896,7 +948,7 @@ fn self_test(out: &Path) {
     app.no_apply = true;
     app.scan(false);
     if let Ok(a) = std::env::var("CURSORDROP_SELFTEST_ACTIVE") {
-        app.state.active = Some(Active { archive: a, scheme: 0 });
+        app.state.active = Some(Active::pack(&a, 0));
     }
     let _ = fs::create_dir_all(out);
     ui::self_test(&mut app, out);

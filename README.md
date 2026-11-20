@@ -28,6 +28,14 @@ unzip it anywhere and run `CursorDrop.exe`. It's portable: no installer and no a
   warns if what you're dragging isn't one). It's applied straight away.
 - **See what changes:** click a pack. Each of the 17 Windows cursors is shown as it is now
   and as it would be with the pack; animated `.ani` cursors play.
+- **Change any cursor:** click a cursor in the grid to pick a different one: any cursor in
+  the pack (handy when its file names don't say what they are), from another pack or preset,
+  **Keep current** or **Windows default**. Changed cursors are marked **Edited**; **Reset
+  changes** puts the pack back.
+- **Presets:** **Current cursors**, always first in the list, shows what you use now. Change
+  any of its cursors (or a pack's) and **Save as preset…**: the cursors are copied into the
+  preset, so it keeps working even if the packs are removed. Presets can be used, changed,
+  renamed and deleted like packs, and are in the tray menu too.
 - **Variants:** packs with several versions (sizes, colours, characters…) get browser-style
   tabs, named after their folders. Many variants scroll: use the arrows, the mouse wheel
   over the tabs, or Left / Right. Hover a tab to see its full name.

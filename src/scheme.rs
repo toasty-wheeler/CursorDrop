@@ -153,6 +153,19 @@ pub fn discover(root: &Path, fallback_name: &str) -> Vec<Scheme> {
                 }
             }
         }
+        // Packs often name every file "<name>_<role>" and the normal pointer just "<name>"
+        // ("mela.cur" next to "mela_busy.ani"): a file that is only the shared prefix is the
+        // normal pointer.
+        if files[0].is_none() && files_in_dir.len() > 1 {
+            let firsts: Vec<Vec<String>> = files_in_dir.iter().map(|f| tokens(&f.file_stem().unwrap_or_default().to_string_lossy())).collect();
+            if let Some(prefix) = firsts.first().and_then(|t| t.first()).cloned() {
+                if firsts.iter().all(|t| t.first() == Some(&prefix)) {
+                    if let Some(i) = firsts.iter().position(|t| t.len() == 1) {
+                        files[0] = Some(rel_string(root, &files_in_dir[i]));
+                    }
+                }
+            }
+        }
         let s = Scheme { name: String::new(), label: String::new(), files };
         if usable(&s) {
             let parts = dir
@@ -433,16 +446,16 @@ pub fn classify(stem: &str) -> Option<usize> {
         ("AppStarting", &["appstart", "background", "working", "work", "progress", "bgbusy"]),
         ("Wait", &["busy", "wait", "loading", "hourglass", "load"]),
         ("Help", &["help", "question"]),
-        ("Crosshair", &["precision", "crosshair", "cross", "precise"]),
+        ("Crosshair", &["precision", "crosshair", "cross", "precise", "accuracy", "accurate", "aim", "target"]),
         ("IBeam", &["ibeam", "beam", "text", "caret"]),
         ("NWPen", &["handwrit", "pen", "nwpen", "write", "writing"]),
-        ("SizeNWSE", &["nwse", "dgn1", "diag1", "diagonal1", "diagonalresize1", "diagonal 1", "sizenwse"]),
-        ("SizeNESW", &["nesw", "dgn2", "diag2", "diagonal2", "diagonalresize2", "sizenesw"]),
-        ("SizeNS", &["vertical", "vert", "sizens", "ns", "updown"]),
-        ("SizeWE", &["horizontal", "horz", "horiz", "sizewe", "ew", "we", "leftright"]),
+        ("SizeNWSE", &["nwse", "dgn1", "diag1", "diagonal1", "diagonalresize1", "diagonal 1", "sizenwse", "nw", "se"]),
+        ("SizeNESW", &["nesw", "dgn2", "diag2", "diagonal2", "diagonalresize2", "sizenesw", "ne", "sw"]),
+        ("SizeNS", &["vertical", "vert", "sizens", "ns", "updown", "height"]),
+        ("SizeWE", &["horizontal", "horz", "horiz", "sizewe", "ew", "we", "leftright", "width"]),
         ("SizeAll", &["move", "sizeall", "all", "fourway"]),
-        ("No", &["unavail", "notallowed", "forbidden", "no", "denied", "blocked", "unavailable"]),
-        ("UpArrow", &["alternate", "alt", "uparrow", "up"]),
+        ("No", &["unavail", "notallowed", "forbidden", "no", "denied", "blocked", "unavailable", "stop"]),
+        ("UpArrow", &["alternat", "alt", "uparrow", "up"]),
         ("Hand", &["link", "hand", "finger"]),
         ("Pin", &["pin", "location"]),
         ("Person", &["person"]),
@@ -490,6 +503,9 @@ mod tests {
             ("aero_person", "Person"), ("beam_r", "IBeam"), ("cross_r", "Crosshair"),
             ("SizeNS", "SizeNS"), ("SizeWE", "SizeWE"), ("SizeAll", "SizeAll"), ("IBeam", "IBeam"),
             ("01-Normal", "Arrow"), ("dgn1", "SizeNWSE"), ("horz", "SizeWE"), ("unavailiable", "No"),
+            ("mela_accuracy", "Crosshair"), ("mela_alternative", "UpArrow"), ("mela_backwork", "AppStarting"),
+            ("mela_stop", "No"), ("mela_width", "SizeWE"), ("mela_ne", "SizeNESW"), ("mela_nw", "SizeNWSE"),
+            ("mela_vertical", "SizeNS"), ("mela_busy", "Wait"), ("Alternate Select", "UpArrow"),
         ];
         for (stem, want) in cases {
             assert_eq!(role(stem), want, "{stem}");

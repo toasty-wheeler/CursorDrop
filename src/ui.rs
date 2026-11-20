@@ -8,6 +8,7 @@
 use crate::cursors::{self, wide};
 use crate::gfx::*;
 use crate::scheme::{ROLE_LABELS, ROLES, Scheme};
+use crate::edit::{Pick, PickSource, Sheet, Slot};
 use crate::{Active, App, Installed};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,6 +41,8 @@ const G_DROP: &str = "\u{E896}";
 const G_WARNING: &str = "\u{E7BA}";
 const G_LEFT: &str = "\u{E76B}";
 const G_RIGHT: &str = "\u{E76C}";
+const G_EDIT: &str = "\u{E70F}";
+const G_CLOSE: &str = "\u{E711}";
 
 pub const THEME_AUTO: u8 = 0;
 pub const THEME_LIGHT: u8 = 1;
@@ -56,6 +59,18 @@ const BTN_RESTORE: usize = 3;
 const BTN_APPLY: usize = 4;
 const BTN_SHOW: usize = 5;
 const BTN_REMOVE: usize = 6;
+const BTN_SAVE_PRESET: usize = 7;
+const BTN_RESET: usize = 8;
+const BTN_RENAME: usize = 9;
+const BTN_DELETE_PRESET: usize = 10;
+const BTN_DIALOG_CANCEL: usize = 11;
+const BTN_DIALOG_SAVE: usize = 12;
+const BTN_DIALOG_SAVE_USE: usize = 13;
+
+// Picker options.
+const OPT_KEEP: usize = 0;
+const OPT_DEFAULT: usize = 1;
+const OPT_OWN: usize = 2;
 
 // Layout, in 96-dpi units (like DS4-Native).
 const MARGIN: f32 = 24.0;
@@ -99,7 +114,16 @@ impl Default for UiSettings {
 #[derive(Clone, PartialEq)]
 pub enum View {
     List,
-    Detail { archive: String, variant: usize },
+    /// The cursor grid of a pack variant, of the cursors in use, or of a preset.
+    Detail(Sheet),
+}
+
+/// A row of the list.
+#[derive(Clone, PartialEq)]
+enum RowRef {
+    Current,
+    Preset(String),
+    Pack(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -118,6 +142,13 @@ enum Kind {
     TabNext,
     Tile,
     Thumb,
+    // The cursor picker (over the grid) and the preset name dialog.
+    PickerVeil,
+    PickerClose,
+    PickerOption,
+    PickerSource,
+    PickerFile,
+    DialogVeil,
 }
 
 type Hit = (Kind, usize);
@@ -199,7 +230,10 @@ pub struct Ui {
     shell: HashMap<String, (HICON, String)>,
     canvas: Option<Canvas>,
     t0: Instant,
-    row_order: Vec<String>,
+    row_order: Vec<RowRef>,
+    /// The cursor picker, when open, and the preset name dialog.
+    picker: Option<Picker>,
+    dialog: Option<NameDialog>,
     animated: bool,
     pub told_about_tray: bool,
     mouse: Option<(f32, f32)>,
@@ -219,6 +253,33 @@ struct TabStrip {
     /// Bring the selected tab into view on the next paint; `snap` skips the easing.
     reveal: bool,
     snap: bool,
+}
+
+/// The cursor picker: which slot of which sheet, the cursors on offer and its scrolling.
+struct Picker {
+    sheet: Sheet,
+    role: usize,
+    sources: Vec<PickSource>,
+    source: usize,
+    list_scroll: f32,
+    list_max: f32,
+    list_area: R,
+    grid_scroll: f32,
+    grid_max: f32,
+    grid_area: R,
+}
+
+/// The "Save as preset" / "Rename preset" dialog. The text box is a real Windows edit control
+/// (typing, selection, clipboard and IME for free), placed over the painted card.
+struct NameDialog {
+    /// Some(sheet) to save it as a preset; None to rename the preset `rename`.
+    save: Option<Sheet>,
+    rename: Option<String>,
+    edit: HWND,
+    /// Used when there is no edit control (the self-test).
+    text: String,
+    error: Option<String>,
+    edit_rect: (i32, i32, i32, i32),
 }
 
 impl Default for Ui {
@@ -250,6 +311,8 @@ impl Default for Ui {
             canvas: None,
             t0: Instant::now(),
             row_order: vec![],
+            picker: None,
+            dialog: None,
             animated: false,
             told_about_tray: false,
             tabs: TabStrip::default(),
@@ -426,8 +489,42 @@ impl Pack {
     }
 }
 
+/// A preset as the list shows it.
+struct PresetRow {
+    preset: crate::edit::Preset,
+    /// A few of its cursors for the preview.
+    preview: Vec<String>,
+    mapped: usize,
+}
+
+/// One slot of the open grid.
+struct SlotView {
+    /// The cursor to draw (a file; the Windows default's file for "Default").
+    shown: String,
+    /// The file name, "Windows default" or "Keep current".
+    label: String,
+    keep: bool,
+    edited: bool,
+    missing: bool,
+}
+
+/// The open grid, ready to draw.
+struct SheetView {
+    sheet: Sheet,
+    title: String,
+    subtitle: String,
+    tabs: Option<(Vec<String>, usize)>,
+    slots: Vec<SlotView>,
+    in_use: bool,
+    edits: usize,
+}
+
 struct Model {
     packs: Vec<Pack>,
+    presets: Vec<PresetRow>,
+    current_preview: Vec<String>,
+    current_edits: usize,
+    sheet: Option<SheetView>,
     active: Option<Active>,
     startup: bool,
     can_restore: bool,
@@ -464,9 +561,53 @@ impl Model {
             let o = o.then_with(|| a.inst.archive.to_lowercase().cmp(&b.inst.archive.to_lowercase()));
             if s.sort_ascending { o } else { o.reverse() }
         });
+        let active = if current { app.state.active.clone() } else { None };
+        let mut presets: Vec<PresetRow> = app
+            .presets()
+            .iter()
+            .map(|p| {
+                let sheet = Sheet::Preset { id: p.id.clone() };
+                let preview = [0usize, 3, 14, 5]
+                    .iter()
+                    .filter_map(|&r| match app.slot(&sheet, r) {
+                        Slot::File(f) => Some(f),
+                        _ => None,
+                    })
+                    .collect();
+                let mapped = p.picks.iter().filter(|k| !matches!(k, Pick::Default)).count();
+                PresetRow { preset: p.clone(), preview, mapped }
+            })
+            .collect();
+        presets.sort_by(|a, b| {
+            let o = match s.sort_column {
+                1 => a.preset.created.cmp(&b.preset.created),
+                3 => a.preset.size.cmp(&b.preset.size),
+                4 => a.mapped.cmp(&b.mapped),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let o = o.then_with(|| a.preset.name.to_lowercase().cmp(&b.preset.name.to_lowercase()));
+            if s.sort_ascending { o } else { o.reverse() }
+        });
+        let now = current_cursors();
+        let current_preview = [0usize, 3, 14, 5]
+            .iter()
+            .map(|&r| match app.slot(&Sheet::Current, r) {
+                Slot::File(f) => f,
+                Slot::Keep => now[r].clone(),
+                Slot::Default => default_cursor(r),
+            })
+            .collect();
+        let sheet = match &app.ui.view {
+            View::Detail(sheet) => sheet_view(app, sheet, active.as_ref(), &now),
+            View::List => None,
+        };
         Model {
             packs,
-            active: if current { app.state.active.clone() } else { None },
+            presets,
+            current_preview,
+            current_edits: app.edits(&Sheet::Current),
+            sheet,
+            active,
             startup: app.startup_enabled(),
             can_restore: current && app.state.backup.is_some(),
             close_to_tray: s.close_to_tray,
@@ -484,8 +625,62 @@ impl Model {
 
     fn active_name(&self) -> Option<String> {
         let a = self.active.as_ref()?;
+        if let Some(id) = &a.preset {
+            return self.presets.iter().find(|p| p.preset.id == *id).map(|p| p.preset.name.clone());
+        }
         Some(self.pack(&a.archive)?.inst.schemes.get(a.scheme)?.display().to_string())
     }
+
+    fn preset(&self, id: &str) -> Option<&PresetRow> {
+        self.presets.iter().find(|p| p.preset.id == id)
+    }
+}
+
+/// Prepares the open grid: title, tabs and what each of its 17 slots comes to.
+fn sheet_view(app: &App, sheet: &Sheet, active: Option<&Active>, now: &[String]) -> Option<SheetView> {
+    let edits = app.edits(sheet);
+    let in_use = active.is_some_and(|a| a.sheet() == *sheet);
+    let (title, subtitle, tabs) = match sheet {
+        Sheet::Pack { archive, variant } => {
+            let inst = app.find(archive)?;
+            let scheme = inst.schemes.get(*variant)?;
+            let tabs = (inst.schemes.len() > 1).then(|| (inst.schemes.iter().map(|s| s.display().to_string()).collect(), *variant));
+            (scheme.display().to_string(), format!("{}   \u{00B7}   {} of {} cursors", archive, scheme.mapped(), ROLES.len()), tabs)
+        }
+        Sheet::Current => ("Current cursors".to_string(), "What Windows uses right now   \u{00B7}   change any of them and save it as a preset".to_string(), None),
+        Sheet::Preset { id } => {
+            let p = app.preset(id)?;
+            (p.name.clone(), format!("Preset   \u{00B7}   saved {}", format_date(p.created)), None)
+        }
+    };
+    let slots = (0..ROLES.len())
+        .map(|role| {
+            let slot = app.slot(sheet, role);
+            let (shown, label, keep) = match &slot {
+                Slot::File(f) => (f.clone(), crate::scheme::fix_mojibake(&Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()), false),
+                Slot::Keep => (now[role].clone(), "Keep current".to_string(), true),
+                Slot::Default => (default_cursor(role), "Windows default".to_string(), false),
+            };
+            let missing = matches!(&slot, Slot::File(f) if !Path::new(f).is_file());
+            let file_name = |p: &str| crate::scheme::fix_mojibake(&Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let label = match sheet {
+                // Preset files are stored as "NN Role.ext": show the name it came with.
+                Sheet::Preset { id } if matches!(slot, Slot::File(_)) => app
+                    .preset(id)
+                    .and_then(|p| p.from.get(role).filter(|n| !n.is_empty()).cloned())
+                    .unwrap_or_else(|| "Saved in this preset".to_string()),
+                // On Current, an untouched slot is simply the file in use.
+                Sheet::Current if keep => match cursors::get_string(cursors::CURSORS_KEY, Some(ROLES[role])) {
+                    Some(v) if !v.trim().is_empty() => file_name(&v),
+                    _ => "Windows default".to_string(),
+                },
+                _ => label,
+            };
+            SlotView { shown, label, keep, edited: app.slot_edited(sheet, role), missing }
+        })
+        .collect();
+    let subtitle = if in_use { format!("{subtitle}   \u{00B7}   In use") } else { subtitle };
+    Some(SheetView { sheet: sheet.clone(), title, subtitle, tabs, slots, in_use, edits })
 }
 
 // ---------------------------------------------------------------- painter
@@ -611,6 +806,17 @@ impl Painter<'_> {
         self.g.fill_round(R::new(area.right() - self.s(5.0) - w, y, w, th), w / 2.0, c);
     }
 
+    /// A scrollbar that only shows the position (the picker's; it scrolls with the wheel).
+    fn plain_scrollbar(&self, area: R, scroll: f32, max: f32) {
+        if max <= 0.5 {
+            return;
+        }
+        let track_h = area.h - self.s(8.0);
+        let th = (track_h * area.h / (area.h + max)).max(self.s(36.0));
+        let y = area.y + self.s(4.0) + (track_h - th) * (scroll / max);
+        self.g.fill_round(R::new(area.right() - self.s(9.0), y, self.s(4.0), th), self.s(2.0), with_alpha(self.p.subtext, 100));
+    }
+
     fn menu(&mut self, anchor: R, width: f32, names: &[&str], glyphs: &[&str], selected: usize) {
         let p = self.p;
         let row_h = self.s(34.0);
@@ -697,12 +903,11 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
         animated: false,
     };
 
-    // A detail view whose pack disappeared goes back to the list.
-    if let View::Detail { archive, .. } = &ui.view {
-        if model.pack(archive).is_none_or(|p| p.inst.schemes.is_empty()) {
-            ui.view = View::List;
-            ui.scroll = 0.0;
-        }
+    // A grid whose pack or preset disappeared goes back to the list.
+    if matches!(ui.view, View::Detail(_)) && model.sheet.is_none() {
+        ui.view = View::List;
+        ui.scroll = 0.0;
+        ui.picker = None;
     }
 
     let p = pt.p;
@@ -720,11 +925,11 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
             draw_list(&mut pt, ui, &model, content);
             draw_list_footer(&mut pt, &model, ui.knobs, w, h);
         }
-        View::Detail { archive, variant } => {
-            let pack = model.pack(&archive).unwrap();
-            let variant = variant.min(pack.inst.schemes.len() - 1);
-            draw_detail(&mut pt, ui, &model, pack, variant, content, m);
-            draw_detail_footer(&mut pt, &model, pack, variant, ui.knobs, w, h);
+        View::Detail(_) => {
+            if let Some(sv) = &model.sheet {
+                draw_detail(&mut pt, ui, sv, content, m);
+                draw_detail_footer(&mut pt, sv, w, h);
+            }
         }
     }
 
@@ -742,6 +947,12 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
     if ui.theme_open {
         let auto_glyph = if pt.dark { G_MOON } else { G_SUN };
         pt.menu(theme_btn, pt.s(170.0), &THEME_NAMES, &[auto_glyph, G_SUN, G_MOON], model.theme as usize);
+    }
+    if let Some(picker) = &mut ui.picker {
+        draw_picker(&mut pt, picker, model.sheet.as_ref(), w, h);
+    }
+    if let Some(dialog) = &mut ui.dialog {
+        draw_dialog(&mut pt, dialog, w, h);
     }
     if ui.drag_t > 0.0 {
         if let Some(info) = &ui.drag_shown {
@@ -847,10 +1058,92 @@ fn draw_list(pt: &mut Painter, ui: &mut Ui, model: &Model, card: R) {
 
     let area = R::new(card.x, hr.bottom() + pt.s(1.0), card.w, card.bottom() - hr.bottom() - pt.s(6.0));
     ui.scroll_area = area;
-    ui.row_order = model.packs.iter().map(|p| p.inst.archive.clone()).collect();
+    // Current cursors first, then presets, then packs.
+    let mut rows = vec![RowRef::Current];
+    rows.extend(model.presets.iter().map(|p| RowRef::Preset(p.preset.id.clone())));
+    rows.extend(model.packs.iter().map(|p| RowRef::Pack(p.inst.archive.clone())));
+    ui.row_order = rows.clone();
 
-    if model.packs.is_empty() {
-        let hint = R::new(area.x + area.w / 2.0 - pt.s(220.0), area.y + area.h / 2.0 - pt.s(80.0), pt.s(440.0), pt.s(160.0));
+    let total = pt.s(6.0) + pt.s(ROW_H) * rows.len() as f32;
+    ui.scroll_max = (total - area.h).max(0.0);
+    ui.scroll = ui.scroll.clamp(0.0, ui.scroll_max);
+    pt.g.clip(area);
+    let mut y = area.y + pt.s(4.0) - ui.scroll;
+    for (i, row_ref) in rows.iter().enumerate() {
+        let row = R::new(card.x + pt.s(6.0), y, card.w - pt.s(12.0), pt.s(ROW_H));
+        y += pt.s(ROW_H);
+        if !row.intersects(&area) {
+            continue;
+        }
+        let visible = R::new(row.x, row.y.max(area.y), row.w, row.bottom().min(area.bottom()) - row.y.max(area.y));
+        let hovered = pt.add(Kind::Row, i, visible);
+        let line = match row_ref {
+            RowRef::Current => RowLine {
+                icon: RowIcon::App,
+                name: "Current cursors".into(),
+                chip: (model.current_edits > 0).then(|| (format!("{} unsaved", model.current_edits), false)),
+                date: String::new(),
+                kind: "Your cursors right now".into(),
+                size: String::new(),
+                preview: model.current_preview.clone(),
+                count: String::new(),
+                active: false,
+                error: None,
+            },
+            RowRef::Preset(id) => {
+                let Some(p) = model.preset(id) else { continue };
+                let active = model.active.as_ref().is_some_and(|a| a.preset.as_deref() == Some(id.as_str()));
+                RowLine {
+                    icon: RowIcon::App,
+                    name: p.preset.name.clone(),
+                    chip: active.then(|| ("In use".to_string(), true)),
+                    date: format_date(p.preset.created),
+                    kind: "Cursor preset".into(),
+                    size: format_size(p.preset.size),
+                    preview: p.preview.clone(),
+                    count: format!("{}/{}", p.mapped, ROLES.len()),
+                    active,
+                    error: None,
+                }
+            }
+            RowRef::Pack(archive) => {
+                let Some(pack) = model.pack(archive) else { continue };
+                let inst = &pack.inst;
+                let active = model.active.as_ref().is_some_and(|a| a.preset.is_none() && a.archive == inst.archive);
+                let (preview, count) = match inst.schemes.first() {
+                    Some(s) => (
+                        [0usize, 3, 14, 5].iter().filter_map(|&r| pack.path(s, r)).collect(),
+                        if inst.schemes.len() > 1 { format!("{} variants", inst.schemes.len()) } else { format!("{}/{}", s.mapped(), ROLES.len()) },
+                    ),
+                    None => (vec![], String::new()),
+                };
+                let error = inst.error.as_ref().map(|e| if e.contains("no recognizable") { "No cursors found".to_string() } else { e.clone() });
+                RowLine {
+                    icon: RowIcon::File(inst.archive.clone()),
+                    name: inst.archive.clone(),
+                    chip: active.then(|| ("In use".to_string(), true)),
+                    date: format_date(inst.mtime),
+                    kind: String::new(),
+                    size: format_size(inst.size),
+                    preview,
+                    count,
+                    active,
+                    error,
+                }
+            }
+        };
+        draw_row(pt, &xs, row, area, &line, hovered);
+        // A thin line under Current cursors sets it apart from the presets and packs.
+        if i == 0 && rows.len() > 1 {
+            pt.g.line(row.x + pt.s(8.0), row.bottom(), row.right() - pt.s(8.0), row.bottom(), p.line, pt.s(1.0));
+        }
+    }
+    pt.g.unclip();
+    pt.scrollbar(area, ui.scroll, ui.scroll_max);
+
+    if model.packs.is_empty() && model.presets.is_empty() {
+        let free = R::new(area.x, area.y + pt.s(ROW_H + 8.0), area.w, area.h - pt.s(ROW_H + 8.0));
+        let hint = R::new(free.x + free.w / 2.0 - pt.s(220.0), free.y + free.h / 2.0 - pt.s(80.0), pt.s(440.0), pt.s(160.0));
         pt.g.dashed_round(hint, pt.s(14.0), with_alpha(p.subtext, 120), pt.s(1.5), 0.0);
         pt.g.text(G_DROP, &pt.f.title, pt.accent, R::new(hint.x, hint.y + pt.s(26.0), hint.w, pt.s(32.0)), Align::Center, Align::Center);
         pt.g.text("Drop cursor packs here", &pt.f.body, p.text, R::new(hint.x, hint.y + pt.s(70.0), hint.w, pt.s(22.0)), Align::Center, Align::Center);
@@ -862,79 +1155,84 @@ fn draw_list(pt: &mut Painter, ui: &mut Ui, model: &Model, card: R) {
             Align::Center,
             Align::Center,
         );
-        ui.scroll_max = 0.0;
+    }
+}
+
+enum RowIcon {
+    /// The app's own icon (Current cursors, presets).
+    App,
+    /// The file type's icon, as Explorer shows it.
+    File(String),
+}
+
+/// One list row's contents, whatever it stands for.
+struct RowLine {
+    icon: RowIcon,
+    name: String,
+    /// A chip after the name: (text, filled with the accent colour).
+    chip: Option<(String, bool)>,
+    date: String,
+    /// Type column; empty = the file type's name from Windows.
+    kind: String,
+    size: String,
+    preview: Vec<String>,
+    count: String,
+    active: bool,
+    error: Option<String>,
+}
+
+fn draw_row(pt: &mut Painter, xs: &[f32; 6], row: R, area: R, line: &RowLine, hovered: bool) {
+    let p = pt.p;
+    if hovered {
+        pt.g.fill_round(row, pt.s(8.0), p.hover);
+    }
+    if line.active {
+        pt.g.fill_round(R::new(row.x + pt.s(1.0), row.y + pt.s(11.0), pt.s(3.0), row.h - pt.s(22.0)), pt.s(1.5), pt.accent);
+    }
+    let text = if line.error.is_none() { p.text } else { with_alpha(p.text, 130) };
+    let pad = pt.s(14.0);
+    let cell = |c: usize| R::new(xs[c], row.y, xs[c + 1] - xs[c] - pad, row.h);
+    let icon_size = pt.s(16.0).round();
+    let (icon, type_name) = match &line.icon {
+        RowIcon::File(name) => shell_info(pt.shell, name).clone(),
+        RowIcon::App => (app_icon(icon_size as i32), String::new()),
+    };
+    pt.g.cursor(icon, xs[0], row.y + (row.h - icon_size) / 2.0, icon_size, 0, Some(area));
+    let name_r = R::new(xs[0] + pt.s(26.0), row.y, cell(0).w - pt.s(26.0), row.h);
+    let chip_w = line.chip.as_ref().map_or(0.0, |(t, _)| pt.g.measure(t, &pt.f.tiny) + pt.s(22.0));
+    let name_w = pt.g.measure(&line.name, &pt.f.body).min(name_r.w - chip_w);
+    pt.g.label(&line.name, &pt.f.body, text, R::new(name_r.x, row.y, name_w + pt.s(2.0), row.h));
+    if let Some((t, filled)) = &line.chip {
+        let chip = R::new(name_r.x + name_w + pt.s(8.0), row.y + (row.h - pt.s(18.0)) / 2.0, chip_w - pt.s(8.0), pt.s(18.0));
+        if *filled {
+            pt.g.fill_round(chip, pt.s(9.0), pt.accent);
+            pt.g.text(t, &pt.f.tiny, on_accent(pt.accent), chip, Align::Center, Align::Center);
+        } else {
+            pt.g.stroke_round(chip, pt.s(9.0), pt.accent, pt.s(1.2));
+            pt.g.text(t, &pt.f.tiny, pt.accent, chip, Align::Center, Align::Center);
+        }
+    }
+    pt.g.label(&line.date, &pt.f.caption, p.subtext, cell(1));
+    pt.g.label(if line.kind.is_empty() { &type_name } else { &line.kind }, &pt.f.caption, p.subtext, cell(2));
+    pt.g.label(&line.size, &pt.f.caption, p.subtext, cell(3));
+
+    // Cursors: a few of them, and how many roles are covered.
+    let c = cell(4);
+    if let Some(e) = &line.error {
+        pt.g.text(G_WARNING, &pt.f.glyph, WARNING, R::new(c.x, row.y, pt.s(14.0), row.h), Align::Center, Align::Center);
+        pt.g.label(e, &pt.f.caption, WARNING, R::new(c.x + pt.s(20.0), row.y, c.w - pt.s(20.0), row.h));
         return;
     }
-
-    let total = pt.s(6.0) + pt.s(ROW_H) * model.packs.len() as f32;
-    ui.scroll_max = (total - area.h).max(0.0);
-    ui.scroll = ui.scroll.clamp(0.0, ui.scroll_max);
-    pt.g.clip(area);
-    let mut y = area.y + pt.s(4.0) - ui.scroll;
-    for (i, pack) in model.packs.iter().enumerate() {
-        let row = R::new(card.x + pt.s(6.0), y, card.w - pt.s(12.0), pt.s(ROW_H));
-        y += pt.s(ROW_H);
-        if !row.intersects(&area) {
-            continue;
+    let mut x = c.x;
+    let size = pt.s(24.0);
+    for path in &line.preview {
+        if x + size > c.right() - pt.s(40.0) {
+            break;
         }
-        let visible = R::new(row.x, row.y.max(area.y), row.w, row.bottom().min(area.bottom()) - row.y.max(area.y));
-        let inst = &pack.inst;
-        let ok = inst.error.is_none();
-        let is_active = model.active.as_ref().is_some_and(|a| a.archive == inst.archive);
-        if pt.add(Kind::Row, i, visible) {
-            pt.g.fill_round(row, pt.s(8.0), p.hover);
-        }
-        if is_active {
-            pt.g.fill_round(R::new(row.x + pt.s(1.0), row.y + pt.s(11.0), pt.s(3.0), row.h - pt.s(22.0)), pt.s(1.5), pt.accent);
-        }
-        let text = if ok { p.text } else { with_alpha(p.text, 130) };
-        // Name: the file type's icon and the file name, with an "In use" chip.
-        let (icon, type_name) = shell_info(pt.shell, &inst.archive).clone();
-        let pad = pt.s(14.0);
-        let cell = |c: usize| R::new(xs[c], row.y, xs[c + 1] - xs[c] - pad, row.h);
-        let icon_size = pt.s(16.0).round();
-        pt.g.cursor(icon, xs[0], row.y + (row.h - icon_size) / 2.0, icon_size, 0, Some(area));
-        let name_r = R::new(xs[0] + pt.s(26.0), row.y, cell(0).w - pt.s(26.0), row.h);
-        let chip_w = if is_active { pt.s(52.0) } else { 0.0 };
-        let name_w = pt.g.measure(&inst.archive, &pt.f.body).min(name_r.w - chip_w);
-        pt.g.label(&inst.archive, &pt.f.body, text, R::new(name_r.x, row.y, name_w + pt.s(2.0), row.h));
-        if is_active {
-            let chip = R::new(name_r.x + name_w + pt.s(8.0), row.y + (row.h - pt.s(18.0)) / 2.0, pt.s(46.0), pt.s(18.0));
-            pt.g.fill_round(chip, pt.s(9.0), pt.accent);
-            pt.g.text("In use", &pt.f.tiny, on_accent(pt.accent), chip, Align::Center, Align::Center);
-        }
-        pt.g.label(&format_date(inst.mtime), &pt.f.caption, p.subtext, cell(1));
-        pt.g.label(&type_name, &pt.f.caption, p.subtext, cell(2));
-        pt.g.label(&format_size(inst.size), &pt.f.caption, p.subtext, cell(3));
-
-        // Cursors: a few of the pack's cursors and how many roles it covers.
-        let c = cell(4);
-        match inst.schemes.first() {
-            Some(s) if ok => {
-                let mut x = c.x;
-                let size = pt.s(24.0);
-                for role in [0usize, 3, 14, 5] {
-                    if x + size > c.right() - pt.s(40.0) {
-                        break;
-                    }
-                    if let Some(path) = pack.path(s, role) {
-                        pt.draw_cursor(&path, x + size / 2.0, row.y + row.h / 2.0, size, Some(area), false);
-                        x += size + pt.s(6.0);
-                    }
-                }
-                let n = if inst.schemes.len() > 1 { format!("{} variants", inst.schemes.len()) } else { format!("{}/{}", s.mapped(), ROLES.len()) };
-                pt.g.label(&n, &pt.f.caption, p.subtext, R::new(x + pt.s(4.0), row.y, (c.right() - x).max(0.0), row.h));
-            }
-            _ => {
-                let e = inst.error.clone().unwrap_or_default();
-                let e = if e.is_empty() || e.contains("no recognizable") { "No cursors found".to_string() } else { e };
-                pt.g.text(G_WARNING, &pt.f.glyph, WARNING, R::new(c.x, row.y, pt.s(14.0), row.h), Align::Center, Align::Center);
-                pt.g.label(&e, &pt.f.caption, WARNING, R::new(c.x + pt.s(20.0), row.y, c.w - pt.s(20.0), row.h));
-            }
-        }
+        pt.draw_cursor(path, x + size / 2.0, row.y + row.h / 2.0, size, Some(area), false);
+        x += size + pt.s(6.0);
     }
-    pt.g.unclip();
-    pt.scrollbar(area, ui.scroll, ui.scroll_max);
+    pt.g.label(&line.count, &pt.f.caption, p.subtext, R::new(x + pt.s(4.0), row.y, (c.right() - x).max(0.0), row.h));
 }
 
 fn footer_card(pt: &mut Painter, knobs: [f32; 2], close_to_tray: bool, w: f32, h: f32) -> R {
@@ -975,18 +1273,41 @@ fn draw_list_footer(pt: &mut Painter, model: &Model, knobs: [f32; 2], w: f32, h:
     );
 }
 
-fn draw_detail_footer(pt: &mut Painter, model: &Model, pack: &Pack, variant: usize, knobs: [f32; 2], w: f32, h: f32) {
-    let footer = footer_card(pt, knobs, model.close_to_tray, w, h);
-    let in_use = model.active.as_ref() == Some(&Active { archive: pack.inst.archive.clone(), scheme: variant });
-    footer_buttons(
-        pt,
-        footer,
-        &[
-            (BTN_REMOVE, "Remove pack", false, true),
-            (BTN_SHOW, "Show in folder", false, true),
-            (BTN_APPLY, if in_use { "In use" } else { "Use these cursors" }, true, !in_use),
-        ],
-    );
+/// The grid's footer: secondary actions on the left, the main ones on the right.
+fn draw_detail_footer(pt: &mut Painter, sv: &SheetView, w: f32, h: f32) {
+    let footer = R::new(pt.s(MARGIN), h - pt.s(FOOTER_H), w - 2.0 * pt.s(MARGIN), pt.s(FOOTER_H) - pt.s(16.0));
+    pt.g.fill_round(footer, pt.s(12.0), pt.p.card);
+    // "Use" is live unless these exact cursors are already in use.
+    let unchanged = sv.slots.iter().zip(current_cursors()).all(|(s, now)| s.keep || same_file(&s.shown, &now));
+    let use_live = !(sv.in_use && unchanged);
+    let use_text = if use_live { "Use these cursors" } else { "In use" };
+    let reset = (BTN_RESET, "Reset changes", false, sv.edits > 0);
+    let (left, right): (Vec<(usize, &str, bool, bool)>, Vec<(usize, &str, bool, bool)>) = match &sv.sheet {
+        Sheet::Pack { .. } => (
+            vec![(BTN_REMOVE, "Remove pack", false, true), (BTN_SHOW, "Show in folder", false, true), reset],
+            vec![(BTN_SAVE_PRESET, "Save as preset\u{2026}", false, true), (BTN_APPLY, use_text, true, use_live)],
+        ),
+        Sheet::Current => (vec![reset], vec![(BTN_SAVE_PRESET, "Save as preset\u{2026}", true, true)]),
+        Sheet::Preset { .. } => (
+            vec![(BTN_DELETE_PRESET, "Delete preset", false, true), (BTN_RENAME, "Rename\u{2026}", false, true)],
+            vec![(BTN_SAVE_PRESET, "Save as new preset\u{2026}", false, true), (BTN_APPLY, use_text, true, use_live)],
+        ),
+    };
+    let y = footer.y + (footer.h - pt.s(32.0)) / 2.0;
+    let width = |pt: &Painter, t: &str| (pt.g.measure(t, &pt.f.caption) + pt.s(40.0)).max(pt.s(118.0));
+    let mut x = footer.x + pt.s(12.0);
+    for &(id, text, primary, live) in &left {
+        let bw = width(pt, text);
+        pt.button(R::new(x, y, bw, pt.s(32.0)), id, text, primary, live);
+        x += bw + pt.s(10.0);
+    }
+    let mut x = footer.right() - pt.s(12.0);
+    for &(id, text, primary, live) in right.iter().rev() {
+        let bw = width(pt, text);
+        x -= bw;
+        pt.button(R::new(x, y, bw, pt.s(32.0)), id, text, primary, live);
+        x -= pt.s(10.0);
+    }
 }
 
 /// Browser-style tabs for a pack's variants. They share the row up to TAB_MAX each; below
@@ -1078,39 +1399,27 @@ fn draw_tabs(pt: &mut Painter, t: &mut TabStrip, r: R, labels: &[String], select
     pt.g.unclip();
 }
 
-fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, variant: usize, content: R, m: f32) {
+fn draw_detail(pt: &mut Painter, ui: &mut Ui, sv: &SheetView, content: R, m: f32) {
     let p = pt.p;
-    let scheme = &pack.inst.schemes[variant];
-    let in_use = model.active.as_ref() == Some(&Active { archive: pack.inst.archive.clone(), scheme: variant });
 
-    // Header: back button, the scheme's name and what's in it.
+    // Header: back button, the sheet's name and what it is.
     let y = pt.s(20.0);
     pt.icon_button(R::new(m, y, pt.s(36.0), pt.s(36.0)), Kind::Back, G_BACK, None, false);
     let tx = m + pt.s(50.0);
-    pt.g.label(scheme.display(), &pt.f.title, p.text, R::new(tx, y - pt.s(2.0), pt.s(520.0), pt.s(28.0)));
-    let status = format!(
-        "{}   \u{00B7}   {} of {} cursors{}",
-        pack.inst.archive,
-        scheme.mapped(),
-        ROLES.len(),
-        if in_use { "   \u{00B7}   In use" } else { "" }
-    );
-    pt.g.label(&status, &pt.f.caption, p.subtext, R::new(tx, y + pt.s(26.0), pt.s(560.0), pt.s(20.0)));
+    pt.g.label(&sv.title, &pt.f.title, p.text, R::new(tx, y - pt.s(2.0), pt.s(560.0), pt.s(28.0)));
+    pt.g.label(&sv.subtitle, &pt.f.caption, p.subtext, R::new(tx, y + pt.s(26.0), pt.s(620.0), pt.s(20.0)));
 
     let mut top = content.y;
-    if pack.inst.schemes.len() > 1 {
-        let labels: Vec<String> = pack.inst.schemes.iter().map(|s| s.display().to_string()).collect();
-        draw_tabs(pt, &mut ui.tabs, R::new(content.x, top, content.w, pt.s(TAB_H)), &labels, variant);
+    if let Some((labels, selected)) = &sv.tabs {
+        draw_tabs(pt, &mut ui.tabs, R::new(content.x, top, content.w, pt.s(TAB_H)), labels, *selected);
         top += pt.s(TAB_H + 12.0);
     } else {
         ui.tabs.area = R::default();
         ui.tabs.max = 0.0;
     }
     let current = current_cursors();
-    let changes = (0..ROLES.len())
-        .filter(|&r| !same_file(&pack.path(scheme, r).unwrap_or_else(|| default_cursor(r)), &current[r]))
-        .count();
-    let label = if in_use {
+    let changes = sv.slots.iter().zip(&current).filter(|(s, now)| !s.keep && !same_file(&s.shown, now)).count();
+    let label = if changes == 0 && (sv.in_use || sv.sheet == Sheet::Current) {
         "YOUR CURSORS".to_string()
     } else if changes == 0 {
         "SAME AS THE CURSORS YOU USE NOW".to_string()
@@ -1118,16 +1427,8 @@ fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, varian
         format!("WHAT CHANGES  \u{00B7}  {changes} OF {}", ROLES.len())
     };
     pt.section_label(content.x, top, pt.s(400.0), &label);
-    if !in_use && changes > 0 {
-        pt.g.text(
-            "Now   \u{2192}   with this pack",
-            &pt.f.caption,
-            p.subtext,
-            R::new(content.right() - pt.s(300.0), top, pt.s(296.0), pt.s(20.0)),
-            Align::Far,
-            Align::Center,
-        );
-    }
+    let legend = if changes > 0 { "Now   \u{2192}   new   \u{00B7}   click a cursor to change it" } else { "Click a cursor to change it" };
+    pt.g.text(legend, &pt.f.caption, p.subtext, R::new(content.right() - pt.s(420.0), top, pt.s(416.0), pt.s(20.0)), Align::Far, Align::Center);
     top += pt.s(26.0);
 
     let area = R::new(content.x - pt.s(4.0), top, content.w + pt.s(8.0), content.bottom() - top);
@@ -1142,7 +1443,7 @@ fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, varian
     ui.scroll = ui.scroll.clamp(0.0, ui.scroll_max);
 
     pt.g.clip(area);
-    for role in 0..ROLES.len() {
+    for (role, slot) in sv.slots.iter().enumerate() {
         let (r_i, c_i) = (role / cols, role % cols);
         let r = R::new(content.x + c_i as f32 * (tile_w + gap), top + pt.s(2.0) + r_i as f32 * (tile_h + gap) - ui.scroll, tile_w, tile_h);
         if !r.intersects(&area) {
@@ -1151,35 +1452,236 @@ fn draw_detail(pt: &mut Painter, ui: &mut Ui, model: &Model, pack: &Pack, varian
         let visible = R::new(r.x, r.y.max(area.y), r.w, r.bottom().min(area.bottom()) - r.y.max(area.y));
         let hovered = pt.add(Kind::Tile, role, visible);
         pt.g.fill_round(r, pt.s(12.0), if hovered { mix(p.card, p.hover, 0.6) } else { p.card });
+        if slot.edited {
+            pt.g.stroke_round(r.inset(pt.s(0.5), pt.s(0.5)), pt.s(12.0), with_alpha(pt.accent, 150), pt.s(1.5));
+        }
 
         let well = R::new(r.x + pt.s(8.0), r.y + pt.s(8.0), r.w - pt.s(16.0), pt.s(92.0));
         pt.g.fill_round(well, pt.s(9.0), with_alpha(p.segment, if pt.dark { 120 } else { 150 }));
-        let new_path = pack.path(scheme, role);
-        let shown = new_path.clone().unwrap_or_else(|| default_cursor(role));
         let cy = well.y + well.h / 2.0 - pt.s(6.0);
         let clip = Some(area);
-        if same_file(&shown, &current[role]) {
-            pt.draw_cursor(&shown, well.x + well.w / 2.0, cy, pt.s(48.0), clip, true);
-            pt.g.text("Unchanged", &pt.f.tiny, p.subtext, R::new(well.x, well.bottom() - pt.s(20.0), well.w, pt.s(16.0)), Align::Center, Align::Center);
+        if slot.keep || same_file(&slot.shown, &current[role]) {
+            pt.draw_cursor(&slot.shown, well.x + well.w / 2.0, cy, pt.s(48.0), clip, true);
+            let note = if slot.keep && sv.sheet != Sheet::Current { "Kept as it is" } else { "Unchanged" };
+            pt.g.text(note, &pt.f.tiny, p.subtext, R::new(well.x, well.bottom() - pt.s(20.0), well.w, pt.s(16.0)), Align::Center, Align::Center);
         } else {
             let (x1, x2) = (well.x + well.w * 0.27, well.x + well.w * 0.71);
             pt.draw_cursor(&current[role], x1, cy, pt.s(32.0), clip, true);
-            pt.draw_cursor(&shown, x2, cy, pt.s(48.0), clip, true);
+            pt.draw_cursor(&slot.shown, x2, cy, pt.s(48.0), clip, true);
             pt.g.text(G_ARROW, &pt.f.glyph, p.subtext, R::new(well.x + well.w * 0.49 - pt.s(8.0), cy - pt.s(8.0), pt.s(16.0), pt.s(16.0)), Align::Center, Align::Center);
             let lab = |x: f32| R::new(x - pt.s(40.0), well.bottom() - pt.s(20.0), pt.s(80.0), pt.s(16.0));
             pt.g.text("Now", &pt.f.tiny, p.subtext, lab(x1), Align::Center, Align::Center);
             pt.g.text("New", &pt.f.tiny, pt.accent, lab(x2), Align::Center, Align::Center);
         }
+        if slot.edited {
+            let chip = R::new(well.x + pt.s(6.0), well.y + pt.s(6.0), pt.s(46.0), pt.s(16.0));
+            pt.g.fill_round(chip, pt.s(8.0), pt.accent);
+            pt.g.text("Edited", &pt.f.tiny, on_accent(pt.accent), chip, Align::Center, Align::Center);
+        }
+        if hovered {
+            let pen = R::new(well.right() - pt.s(26.0), well.y + pt.s(4.0), pt.s(22.0), pt.s(22.0));
+            pt.g.text(G_EDIT, &pt.f.glyph, p.text, pen, Align::Center, Align::Center);
+        }
 
         pt.g.label(ROLE_LABELS[role], &pt.f.body, p.text, R::new(r.x + pt.s(14.0), r.y + pt.s(106.0), r.w - pt.s(28.0), pt.s(20.0)));
-        let file = match &scheme.files[role] {
-            Some(rel) => Path::new(rel).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
-            None => "Windows default".to_string(),
-        };
-        pt.g.label(&file, &pt.f.caption, p.subtext, R::new(r.x + pt.s(14.0), r.y + pt.s(128.0), r.w - pt.s(28.0), pt.s(18.0)));
+        let (label, colour) = if slot.missing { ("File missing".to_string(), WARNING) } else { (slot.label.clone(), p.subtext) };
+        pt.g.label(&label, &pt.f.caption, colour, R::new(r.x + pt.s(14.0), r.y + pt.s(128.0), r.w - pt.s(28.0), pt.s(18.0)));
     }
     pt.g.unclip();
     pt.scrollbar(area, ui.scroll, ui.scroll_max);
+}
+
+const PICK_TILE_W: f32 = 104.0;
+const PICK_TILE_H: f32 = 100.0;
+const PICK_GAP: f32 = 8.0;
+const PICK_LIST_W: f32 = 240.0;
+const PICK_ROW_H: f32 = 52.0;
+const PICK_GROUP_H: f32 = 28.0;
+
+/// The cursor picker for one slot: Keep current / Windows default (/ the pack's own) on top,
+/// then every pack and preset on the left and their cursors on the right.
+fn draw_picker(pt: &mut Painter, pk: &mut Picker, sv: Option<&SheetView>, w: f32, h: f32) {
+    let p = pt.p;
+    let Some(sv) = sv else { return };
+    let slot = &sv.slots[pk.role];
+    pt.add(Kind::PickerVeil, 0, R::new(0.0, 0.0, w, h));
+    pt.g.fill_round(R::new(0.0, 0.0, w, h), 0.0, with_alpha(p.bg, 175));
+
+    let cw = (w - pt.s(48.0)).min(pt.s(900.0));
+    let ch = (h - pt.s(48.0)).min(pt.s(640.0));
+    let card = R::new((w - cw) / 2.0, (h - ch) / 2.0, cw, ch);
+    pt.add(Kind::PickerVeil, 1, card); // clicks inside the card don't close it
+    pt.g.fill_round(R::new(card.x, card.y + pt.s(4.0), card.w, card.h), pt.s(16.0), p.shadow);
+    pt.g.fill_round(card, pt.s(16.0), with_alpha(p.card, 255));
+    pt.g.stroke_round(card, pt.s(16.0), p.line, pt.s(1.0));
+
+    let x0 = card.x + pt.s(24.0);
+    pt.g.label(&format!("Choose \u{201C}{}\u{201D}", ROLE_LABELS[pk.role]), &pt.f.title, p.text, R::new(x0, card.y + pt.s(18.0), card.w - pt.s(100.0), pt.s(28.0)));
+    pt.g.label(&format!("For {}", sv.title), &pt.f.caption, p.subtext, R::new(x0, card.y + pt.s(46.0), card.w - pt.s(100.0), pt.s(18.0)));
+    let close = R::new(card.right() - pt.s(56.0), card.y + pt.s(18.0), pt.s(36.0), pt.s(36.0));
+    pt.icon_button(close, Kind::PickerClose, G_CLOSE, None, false);
+
+    // Keep current / Windows default / the pack's own, each with a small preview.
+    let mut x = x0;
+    let oy = card.y + pt.s(76.0);
+    let now = current_cursors();
+    let keep_selected = slot.keep;
+    let default_selected = !slot.keep && slot.label == "Windows default";
+    let mut options: Vec<(usize, String, String, bool)> = vec![
+        (OPT_KEEP, "Keep current".into(), now[pk.role].clone(), keep_selected),
+        (OPT_DEFAULT, "Windows default".into(), default_cursor(pk.role), default_selected),
+    ];
+    if matches!(sv.sheet, Sheet::Pack { .. }) && slot.edited {
+        options.push((OPT_OWN, "Back to the pack's own".into(), String::new(), false));
+    }
+    for (id, text, preview, selected) in &options {
+        let has_preview = !preview.is_empty();
+        let bw = pt.g.measure(text, &pt.f.caption) + pt.s(if has_preview { 52.0 } else { 28.0 });
+        let r = R::new(x, oy, bw, pt.s(34.0));
+        let hovered = pt.add(Kind::PickerOption, *id, r);
+        pt.g.fill_round(r, pt.s(9.0), if *selected { with_alpha(pt.accent, 40) } else if hovered { p.hover } else { p.segment });
+        if *selected {
+            pt.g.stroke_round(r, pt.s(9.0), pt.accent, pt.s(1.5));
+        }
+        let mut tx = r.x + pt.s(14.0);
+        if has_preview {
+            pt.draw_cursor(preview, r.x + pt.s(22.0), r.y + r.h / 2.0, pt.s(22.0), None, false);
+            tx = r.x + pt.s(40.0);
+        }
+        pt.g.label(text, &pt.f.caption, p.text, R::new(tx, r.y, r.right() - tx - pt.s(8.0), r.h));
+        x = r.right() + pt.s(8.0);
+    }
+
+    // Sources on the left.
+    let top = card.y + pt.s(126.0);
+    let body_h = card.bottom() - pt.s(18.0) - top;
+    let list = R::new(card.x + pt.s(16.0), top, pt.s(PICK_LIST_W), body_h);
+    pk.list_area = list;
+    let list_total = pk.sources.len() as f32 * pt.s(PICK_ROW_H) + pt.s(8.0);
+    pk.list_max = (list_total - list.h).max(0.0);
+    pk.list_scroll = pk.list_scroll.clamp(0.0, pk.list_max);
+    pt.g.fill_round(list, pt.s(12.0), with_alpha(p.segment, if pt.dark { 90 } else { 120 }));
+    pt.g.clip(list);
+    for (i, src) in pk.sources.iter().enumerate() {
+        let r = R::new(list.x + pt.s(4.0), list.y + pt.s(4.0) + i as f32 * pt.s(PICK_ROW_H) - pk.list_scroll, list.w - pt.s(8.0), pt.s(PICK_ROW_H - 4.0));
+        if !r.intersects(&list) {
+            continue;
+        }
+        let hovered = pt.add(Kind::PickerSource, i, R::new(r.x, r.y.max(list.y), r.w, r.bottom().min(list.bottom()) - r.y.max(list.y)));
+        if i == pk.source {
+            pt.g.fill_round(r, pt.s(9.0), p.segment_on);
+            pt.g.fill_round(R::new(r.x + pt.s(1.0), r.y + pt.s(12.0), pt.s(3.0), r.h - pt.s(24.0)), pt.s(1.5), pt.accent);
+        } else if hovered {
+            pt.g.fill_round(r, pt.s(9.0), p.hover);
+        }
+        pt.g.label(&src.label, &pt.f.body, p.text, R::new(r.x + pt.s(14.0), r.y + pt.s(5.0), r.w - pt.s(24.0), pt.s(20.0)));
+        pt.g.label(&src.detail, &pt.f.caption, p.subtext, R::new(r.x + pt.s(14.0), r.y + pt.s(25.0), r.w - pt.s(24.0), pt.s(17.0)));
+    }
+    pt.g.unclip();
+    pt.plain_scrollbar(list, pk.list_scroll, pk.list_max);
+
+    // That source's cursors on the right, by folder.
+    let grid = R::new(list.right() + pt.s(14.0), top, card.right() - pt.s(16.0) - list.right() - pt.s(14.0), body_h);
+    pk.grid_area = grid;
+    let Some(src) = pk.sources.get(pk.source) else {
+        pt.g.text("No other cursors yet: add a pack first.", &pt.f.body, p.subtext, grid, Align::Center, Align::Center);
+        return;
+    };
+    let (tw, th, gap) = (pt.s(PICK_TILE_W), pt.s(PICK_TILE_H), pt.s(PICK_GAP));
+    let cols = (((grid.w - pt.s(10.0) + gap) / (tw + gap)).floor() as usize).max(1);
+    let show_heads = src.groups.len() > 1 || src.groups.first().is_some_and(|g| !g.0.is_empty());
+    let mut height = 0.0;
+    for (_, files) in &src.groups {
+        height += if show_heads { pt.s(PICK_GROUP_H) } else { 0.0 } + files.len().div_ceil(cols) as f32 * (th + gap);
+    }
+    pk.grid_max = (height - grid.h).max(0.0);
+    pk.grid_scroll = pk.grid_scroll.clamp(0.0, pk.grid_max);
+    pt.g.clip(grid);
+    let mut y = grid.y - pk.grid_scroll;
+    let mut flat = 0;
+    for (head, files) in &src.groups {
+        if show_heads {
+            let text = if head.is_empty() { src.label.to_uppercase() } else { head.to_uppercase() };
+            pt.g.label(&text, &pt.f.section, p.subtext, R::new(grid.x + pt.s(2.0), y + pt.s(4.0), grid.w - pt.s(12.0), pt.s(20.0)));
+            y += pt.s(PICK_GROUP_H);
+        }
+        for (i, f) in files.iter().enumerate() {
+            let r = R::new(grid.x + (i % cols) as f32 * (tw + gap), y + (i / cols) as f32 * (th + gap), tw, th);
+            let id = flat + i;
+            if !r.intersects(&grid) {
+                continue;
+            }
+            let hovered = pt.add(Kind::PickerFile, id, R::new(r.x, r.y.max(grid.y), r.w, r.bottom().min(grid.bottom()) - r.y.max(grid.y)));
+            let chosen = !slot.keep && same_file(&f.path, &slot.shown);
+            let fill = if chosen {
+                with_alpha(pt.accent, 36)
+            } else if hovered {
+                p.hover
+            } else {
+                with_alpha(p.segment, if pt.dark { 110 } else { 140 })
+            };
+            pt.g.fill_round(r, pt.s(10.0), fill);
+            if chosen {
+                pt.g.stroke_round(r, pt.s(10.0), pt.accent, pt.s(2.0));
+            }
+            pt.draw_cursor(&f.path, r.x + r.w / 2.0, r.y + pt.s(40.0), pt.s(40.0), Some(grid), hovered || chosen);
+            pt.g.text(&f.name, &pt.f.caption, p.text, R::new(r.x + pt.s(6.0), r.y + pt.s(72.0), r.w - pt.s(12.0), pt.s(20.0)), Align::Center, Align::Center);
+            if f.suggested {
+                let chip = R::new(r.x + pt.s(6.0), r.y + pt.s(6.0), pt.s(42.0), pt.s(15.0));
+                pt.g.fill_round(chip, pt.s(7.5), with_alpha(pt.accent, if chosen { 255 } else { 200 }));
+                pt.g.text("Match", &pt.f.tiny, on_accent(pt.accent), chip, Align::Center, Align::Center);
+            }
+        }
+        y += files.len().div_ceil(cols) as f32 * (th + gap);
+        flat += files.len();
+    }
+    pt.g.unclip();
+    pt.plain_scrollbar(grid, pk.grid_scroll, pk.grid_max);
+}
+
+/// "Save as preset" / "Rename preset": a card with a text box and buttons.
+fn draw_dialog(pt: &mut Painter, d: &mut NameDialog, w: f32, h: f32) {
+    let p = pt.p;
+    pt.add(Kind::DialogVeil, 0, R::new(0.0, 0.0, w, h));
+    pt.g.fill_round(R::new(0.0, 0.0, w, h), 0.0, with_alpha(p.bg, 175));
+    let (cw, ch) = (pt.s(480.0), pt.s(232.0));
+    let card = R::new((w - cw) / 2.0, (h - ch) / 2.0, cw, ch);
+    pt.g.fill_round(R::new(card.x, card.y + pt.s(4.0), card.w, card.h), pt.s(16.0), p.shadow);
+    pt.g.fill_round(card, pt.s(16.0), with_alpha(p.card, 255));
+    pt.g.stroke_round(card, pt.s(16.0), p.line, pt.s(1.0));
+    let saving = d.save.is_some();
+    let x0 = card.x + pt.s(24.0);
+    pt.g.label(if saving { "Save as preset" } else { "Rename preset" }, &pt.f.title, p.text, R::new(x0, card.y + pt.s(20.0), card.w - pt.s(48.0), pt.s(28.0)));
+    let sub = if saving { "Copies all 17 cursors, so it keeps working if packs are removed." } else { "Give the preset a new name." };
+    pt.g.label(sub, &pt.f.caption, p.subtext, R::new(x0, card.y + pt.s(50.0), card.w - pt.s(48.0), pt.s(18.0)));
+
+    let field = R::new(x0, card.y + pt.s(84.0), card.w - pt.s(48.0), pt.s(40.0));
+    pt.g.fill_round(field, pt.s(9.0), p.segment);
+    pt.g.stroke_round(field, pt.s(9.0), pt.accent, pt.s(1.5));
+    let inner = R::new(field.x + pt.s(12.0), field.y + (field.h - pt.s(22.0)) / 2.0, field.w - pt.s(24.0), pt.s(22.0));
+    d.edit_rect = (inner.x.round() as i32, inner.y.round() as i32, inner.w.round() as i32, inner.h.round() as i32);
+    if d.edit.is_null() {
+        pt.g.label(&d.text, &pt.f.body, p.text, inner);
+    }
+    if let Some(e) = &d.error {
+        pt.g.label(e, &pt.f.caption, WARNING, R::new(x0, field.bottom() + pt.s(6.0), field.w, pt.s(18.0)));
+    }
+
+    let y = card.bottom() - pt.s(24.0) - pt.s(34.0);
+    let mut buttons: Vec<(usize, &str, bool)> = vec![(BTN_DIALOG_CANCEL, "Cancel", false)];
+    if saving {
+        buttons.push((BTN_DIALOG_SAVE, "Save", false));
+        buttons.push((BTN_DIALOG_SAVE_USE, "Save and use", true));
+    } else {
+        buttons.push((BTN_DIALOG_SAVE, "Rename", true));
+    }
+    let mut x = card.right() - pt.s(24.0);
+    for &(id, text, primary) in buttons.iter().rev() {
+        let bw = (pt.g.measure(text, &pt.f.caption) + pt.s(40.0)).max(pt.s(96.0));
+        x -= bw;
+        pt.button(R::new(x, y, bw, pt.s(34.0)), id, text, primary, true);
+        x -= pt.s(10.0);
+    }
 }
 
 // ---------------------------------------------------------------- input
@@ -1280,16 +1782,20 @@ pub fn on_button_up(app: &mut App, lp: LPARAM) {
 }
 
 pub fn on_right_click(app: &mut App, lp: LPARAM) {
+    if app.ui.picker.is_some() || app.ui.dialog.is_some() {
+        return;
+    }
     let (x, y) = mouse_pos(lp);
     if let Some((Kind::Row, i)) = hit_test(&app.ui, x, y) {
-        if let Some(archive) = app.ui.row_order.get(i).cloned() {
-            row_menu(app, &archive);
+        if let Some(row) = app.ui.row_order.get(i).cloned() {
+            row_menu(app, &row);
         }
     }
 }
 
-/// WM_MOUSEWHEEL / WM_MOUSEHWHEEL. Over the variant tabs either wheel scrolls them sideways
-/// (wheel down / tilt right = forwards); elsewhere the vertical wheel scrolls the list or grid.
+/// WM_MOUSEWHEEL / WM_MOUSEHWHEEL. In the picker it scrolls the list or the cursors under the
+/// mouse. Over the variant tabs either wheel scrolls them sideways (wheel down / tilt right =
+/// forwards); elsewhere the vertical wheel scrolls the list or grid.
 pub fn on_wheel(app: &mut App, wp: WPARAM, lp: LPARAM, horizontal: bool) {
     let delta = ((wp >> 16) & 0xFFFF) as i16 as f32;
     let ui = &mut app.ui;
@@ -1297,18 +1803,29 @@ pub fn on_wheel(app: &mut App, wp: WPARAM, lp: LPARAM, horizontal: bool) {
     if !ui.hwnd.is_null() {
         unsafe { ScreenToClient(ui.hwnd, &mut pt) };
     }
-    let tabs = &mut ui.tabs;
-    if tabs.max > 0.0 && tabs.area.contains(pt.x as f32, pt.y as f32) {
+    let (mx, my) = (pt.x as f32, pt.y as f32);
+    let step = delta / 120.0 * 72.0 * ui.scale;
+    if let Some(pk) = &mut ui.picker {
+        if !horizontal {
+            if pk.list_area.contains(mx, my) {
+                pk.list_scroll = (pk.list_scroll - step).clamp(0.0, pk.list_max);
+            } else {
+                pk.grid_scroll = (pk.grid_scroll - step).clamp(0.0, pk.grid_max);
+            }
+        }
+    } else if ui.dialog.is_some() {
+    } else if ui.tabs.max > 0.0 && ui.tabs.area.contains(mx, my) {
+        let tabs = &mut ui.tabs;
         let step = delta / 120.0 * tabs.tab_w * 0.8;
         tabs.target = (tabs.target + if horizontal { step } else { -step }).clamp(0.0, tabs.max);
     } else if !horizontal {
-        ui.scroll = (ui.scroll - delta / 120.0 * 72.0 * ui.scale).clamp(0.0, ui.scroll_max);
+        ui.scroll = (ui.scroll - step).clamp(0.0, ui.scroll_max);
     }
     invalidate(ui.hwnd);
 }
 
 fn select_variant(app: &mut App, v: usize) {
-    if let View::Detail { archive, variant } = &mut app.ui.view {
+    if let View::Detail(Sheet::Pack { archive, variant }) = &mut app.ui.view {
         let count = app.state.installed.iter().find(|i| i.archive == *archive).map_or(1, |i| i.schemes.len());
         *variant = v.min(count.saturating_sub(1));
         app.ui.tabs.reveal = true;
@@ -1316,11 +1833,14 @@ fn select_variant(app: &mut App, v: usize) {
 }
 
 pub fn on_key(app: &mut App, vk: u16) {
-    if (vk == VK_ESCAPE || vk == VK_BACK) && app.ui.theme_open {
+    let back = vk == VK_ESCAPE || vk == VK_BACK;
+    if back && app.ui.picker.is_some() {
+        app.ui.picker = None;
+    } else if back && app.ui.theme_open {
         app.ui.theme_open = false;
-    } else if (vk == VK_ESCAPE || vk == VK_BACK) && app.ui.view != View::List {
+    } else if back && app.ui.view != View::List {
         go_list(app);
-    } else if let View::Detail { variant, .. } = app.ui.view {
+    } else if let View::Detail(Sheet::Pack { variant, .. }) = app.ui.view {
         // Left / right arrows step through a pack's variants.
         if vk == VK_LEFT && variant > 0 {
             select_variant(app, variant - 1);
@@ -1335,6 +1855,16 @@ fn go_list(app: &mut App) {
     app.ui.view = View::List;
     app.ui.scroll = 0.0;
     app.ui.hover = None;
+    app.ui.picker = None;
+}
+
+/// Opens a grid: a pack (on the variant in use, if it is), Current cursors or a preset.
+fn open_sheet(app: &mut App, sheet: Sheet) {
+    app.ui.view = View::Detail(sheet);
+    app.ui.scroll = 0.0;
+    app.ui.tabs = TabStrip { reveal: true, snap: true, ..TabStrip::default() };
+    app.ui.hover = None;
+    app.ui.picker = None;
 }
 
 pub fn open_detail(app: &mut App, archive: &str) {
@@ -1343,13 +1873,51 @@ pub fn open_detail(app: &mut App, archive: &str) {
         return;
     }
     let variant = match &app.state.active {
-        Some(a) if a.archive == archive && app.ours_is_current() => a.scheme,
+        Some(a) if a.preset.is_none() && a.archive == archive && app.ours_is_current() => a.scheme,
         _ => 0,
     };
-    app.ui.view = View::Detail { archive: archive.to_string(), variant };
-    app.ui.scroll = 0.0;
-    app.ui.tabs = TabStrip { reveal: true, snap: true, ..TabStrip::default() };
+    open_sheet(app, Sheet::Pack { archive: archive.to_string(), variant });
+}
+
+fn open_row(app: &mut App, row: &RowRef) {
+    match row {
+        RowRef::Current => open_sheet(app, Sheet::Current),
+        RowRef::Preset(id) => open_sheet(app, Sheet::Preset { id: id.clone() }),
+        RowRef::Pack(archive) => open_detail(app, archive),
+    }
+}
+
+fn open_picker(app: &mut App, role: usize) {
+    let View::Detail(sheet) = &app.ui.view else { return };
+    let sheet = sheet.clone();
+    let sources = app.pick_sources(&sheet, role);
+    app.ui.picker = Some(Picker {
+        sheet,
+        role,
+        sources,
+        source: 0,
+        list_scroll: 0.0,
+        list_max: 0.0,
+        list_area: R::default(),
+        grid_scroll: 0.0,
+        grid_max: 0.0,
+        grid_area: R::default(),
+    });
     app.ui.hover = None;
+}
+
+/// Applies a choice from the picker and closes it.
+fn pick(app: &mut App, choice: Option<Pick>) {
+    let Some(pk) = app.ui.picker.take() else { return };
+    if let Err(e) = app.set_pick(&pk.sheet, pk.role, choice) {
+        message(app, &format!("Could not change the cursor: {e}"), true);
+    }
+    // A preset in use takes the change straight away.
+    if let Sheet::Preset { id } = &pk.sheet {
+        if app.ours_is_current() && app.state.active.as_ref().is_some_and(|a| a.preset.as_deref() == Some(id.as_str())) {
+            let _ = app.apply(Active::preset(id));
+        }
+    }
 }
 
 fn action(app: &mut App, (kind, id): Hit) {
@@ -1368,8 +1936,8 @@ fn action(app: &mut App, (kind, id): Hit) {
         }
         Kind::Back => go_list(app),
         Kind::Row => {
-            if let Some(archive) = app.ui.row_order.get(id).cloned() {
-                open_detail(app, &archive);
+            if let Some(row) = app.ui.row_order.get(id).cloned() {
+                open_row(app, &row);
             }
         }
         Kind::ColHeader => {
@@ -1391,77 +1959,303 @@ fn action(app: &mut App, (kind, id): Hit) {
         Kind::TabPrev => app.ui.tabs.target = (app.ui.tabs.target - app.ui.tabs.tab_w * 2.0).max(0.0),
         Kind::TabNext => app.ui.tabs.target = (app.ui.tabs.target + app.ui.tabs.tab_w * 2.0).min(app.ui.tabs.max),
         Kind::Button => button(app, id),
+        Kind::Tile => open_picker(app, id),
+        Kind::PickerVeil if id == 0 => app.ui.picker = None,
+        Kind::PickerClose => app.ui.picker = None,
+        Kind::PickerOption => match id {
+            OPT_KEEP => pick(app, Some(Pick::Keep)),
+            OPT_DEFAULT => pick(app, Some(Pick::Default)),
+            _ => pick(app, None),
+        },
+        Kind::PickerSource => {
+            if let Some(pk) = &mut app.ui.picker {
+                if pk.source != id {
+                    pk.source = id;
+                    pk.grid_scroll = 0.0;
+                }
+            }
+        }
+        Kind::PickerFile => {
+            let path = app.ui.picker.as_ref().and_then(|pk| pk.sources.get(pk.source)).and_then(|s| s.file(id)).map(|f| f.path.clone());
+            if let Some(path) = path {
+                pick(app, Some(Pick::File(path)));
+            }
+        }
         _ => {}
     }
     crate::refresh_tray(app);
 }
 
-fn detail_target(app: &App) -> Option<Active> {
+fn detail_sheet(app: &App) -> Option<Sheet> {
     match &app.ui.view {
-        View::Detail { archive, variant } => Some(Active { archive: archive.clone(), scheme: *variant }),
+        View::Detail(sheet) => Some(sheet.clone()),
         View::List => None,
     }
 }
 
 fn button(app: &mut App, id: usize) {
-    match id {
-        BTN_ADD => add_packs_dialog(app),
-        BTN_FOLDER => crate::open_folder(app),
-        BTN_RESTORE => {
+    let sheet = detail_sheet(app);
+    match (id, sheet) {
+        (BTN_ADD, _) => add_packs_dialog(app),
+        (BTN_FOLDER, _) => crate::open_folder(app),
+        (BTN_RESTORE, _) => {
             if let Err(e) = app.restore() {
                 message(app, &e, true);
             }
         }
-        BTN_APPLY => {
-            if let Some(t) = detail_target(app) {
-                if let Err(e) = app.apply(t) {
-                    message(app, &format!("Could not apply the cursors: {e}"), true);
-                }
-            }
+        (BTN_APPLY, Some(Sheet::Pack { archive, variant })) => use_sheet(app, Active::pack(&archive, variant)),
+        (BTN_APPLY, Some(Sheet::Preset { id })) => use_sheet(app, Active::preset(&id)),
+        (BTN_SHOW, Some(Sheet::Pack { archive, .. })) => show_in_folder(&app.drop_dir.join(&archive)),
+        (BTN_REMOVE, Some(Sheet::Pack { archive, .. })) => remove_pack(app, &archive),
+        (BTN_RESET, Some(sheet)) => app.reset_sheet(&sheet),
+        (BTN_SAVE_PRESET, Some(sheet)) => {
+            let name = match &sheet {
+                Sheet::Current => "My cursors".to_string(),
+                _ => model_title(app, &sheet),
+            };
+            open_dialog(app, Some(sheet), None, &name);
         }
-        BTN_SHOW => {
-            if let Some(t) = detail_target(app) {
-                show_in_folder(&app.drop_dir.join(&t.archive));
-            }
+        (BTN_RENAME, Some(Sheet::Preset { id })) => {
+            let name = app.preset(&id).map(|p| p.name.clone()).unwrap_or_default();
+            open_dialog(app, None, Some(id), &name);
         }
-        BTN_REMOVE => {
-            if let Some(t) = detail_target(app) {
-                remove_pack(app, &t.archive);
-            }
-        }
+        (BTN_DELETE_PRESET, Some(Sheet::Preset { id })) => delete_preset_asking(app, &id),
+        (BTN_DIALOG_CANCEL, _) => close_dialog(app),
+        (BTN_DIALOG_SAVE, _) => confirm_dialog(app, false, None),
+        (BTN_DIALOG_SAVE_USE, _) => confirm_dialog(app, true, None),
         _ => {}
     }
 }
 
-fn row_menu(app: &mut App, archive: &str) {
-    let ok = app.find(archive).is_some_and(|i| !i.schemes.is_empty());
+fn use_sheet(app: &mut App, target: Active) {
+    if let Err(e) = app.apply(target) {
+        message(app, &format!("Could not apply the cursors: {e}"), true);
+    }
+}
+
+/// The sheet's title, as the grid shows it (for a preset's suggested name).
+fn model_title(app: &App, sheet: &Sheet) -> String {
+    match sheet {
+        Sheet::Pack { archive, variant } => {
+            app.find(archive).and_then(|i| i.schemes.get(*variant)).map(|s| s.display().to_string()).unwrap_or_default()
+        }
+        Sheet::Current => "My cursors".to_string(),
+        Sheet::Preset { id } => app.preset(id).map(|p| format!("{} copy", p.name)).unwrap_or_default(),
+    }
+}
+
+fn delete_preset_asking(app: &mut App, id: &str) {
+    let Some(name) = app.preset(id).map(|p| p.name.clone()) else { return };
+    let t = wide("CursorDrop");
+    let q = wide(&format!("Delete the preset \"{name}\"?\n\nIf it's in use, your previous cursors come back."));
+    if unsafe { MessageBoxW(app.ui.hwnd, q.as_ptr(), t.as_ptr(), MB_YESNO | MB_ICONQUESTION) } != IDYES {
+        return;
+    }
+    app.delete_preset(id);
+    go_list(app);
+}
+
+// ---------------------------------------------------------------- the name dialog
+
+// The dialog's text box: a Windows edit control laid over the painted card.
+thread_local! {
+    static NAME_EDIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The name dialog's edit control, so the message loop can catch Enter and Esc in it.
+pub fn name_edit() -> HWND {
+    NAME_EDIT.with(|c| c.get()) as HWND
+}
+
+fn open_dialog(app: &mut App, save: Option<Sheet>, rename: Option<String>, name: &str) {
+    close_dialog(app);
+    app.ui.picker = None;
+    let mut edit: HWND = null_mut();
+    if !app.ui.hwnd.is_null() {
+        unsafe {
+            let class = wide("EDIT");
+            let text = wide(name);
+            edit = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                text.as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                0,
+                0,
+                10,
+                10,
+                app.ui.hwnd,
+                null_mut(),
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null()),
+                null(),
+            );
+            let face = wide("Segoe UI");
+            let font = CreateFontW(-((14.0 * app.ui.scale).round() as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+            SendMessageW(edit, WM_SETFONT, font as usize, 0);
+            SendMessageW(edit, 0x00C5 /* EM_SETLIMITTEXT */, 80, 0);
+            SendMessageW(edit, 0x00B1 /* EM_SETSEL */, 0, -1);
+            SetFocus(edit);
+        }
+        NAME_EDIT.with(|c| c.set(edit as usize));
+    }
+    app.ui.dialog = Some(NameDialog { save, rename, edit, text: name.to_string(), error: None, edit_rect: (0, 0, 0, 0) });
+    invalidate(app.ui.hwnd);
+}
+
+fn close_dialog(app: &mut App) {
+    if let Some(d) = app.ui.dialog.take() {
+        if !d.edit.is_null() {
+            unsafe {
+                let font = SendMessageW(d.edit, WM_GETFONT, 0, 0);
+                DestroyWindow(d.edit);
+                if font != 0 {
+                    DeleteObject(font as HGDIOBJ);
+                }
+                SetFocus(app.ui.hwnd);
+            }
+        }
+        NAME_EDIT.with(|c| c.set(0));
+    }
+    invalidate(app.ui.hwnd);
+}
+
+/// Places the edit control where the last paint put the text box.
+pub fn place_dialog_edit(app: &App) {
+    if let Some(d) = &app.ui.dialog {
+        if !d.edit.is_null() {
+            let (x, y, w, h) = d.edit_rect;
+            let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            unsafe {
+                GetWindowRect(d.edit, &mut rc);
+                let mut tl = POINT { x: rc.left, y: rc.top };
+                ScreenToClient(app.ui.hwnd, &mut tl);
+                if tl.x != x || tl.y != y || rc.right - rc.left != w || rc.bottom - rc.top != h {
+                    MoveWindow(d.edit, x, y, w, h, 1);
+                }
+            }
+        }
+    }
+}
+
+/// WM_CTLCOLOREDIT: the text box in the dialog's colours.
+pub fn edit_colours(app: &App, hdc: HDC) -> isize {
+    thread_local! {
+        static BRUSH: std::cell::Cell<(u32, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let p = if app.ui.dark { DARK } else { LIGHT };
+    let bgr = |c: Color| ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
+    unsafe {
+        SetTextColor(hdc, bgr(p.text));
+        SetBkColor(hdc, bgr(p.segment));
+    }
+    BRUSH.with(|b| {
+        let (colour, brush) = b.get();
+        if brush != 0 && colour == p.segment {
+            return brush as isize;
+        }
+        if brush != 0 {
+            unsafe { DeleteObject(brush as HGDIOBJ) };
+        }
+        let new = unsafe { CreateSolidBrush(bgr(p.segment)) } as usize;
+        b.set((p.segment, new));
+        new as isize
+    })
+}
+
+/// Save / Rename. `text` overrides the edit control (the self-test has none).
+pub fn confirm_dialog(app: &mut App, and_use: bool, text: Option<&str>) {
+    let Some(d) = &app.ui.dialog else { return };
+    let name = match text {
+        Some(t) => t.to_string(),
+        None if !d.edit.is_null() => unsafe {
+            let mut buf = vec![0u16; 128];
+            let n = GetWindowTextW(d.edit, buf.as_mut_ptr(), 128);
+            String::from_utf16_lossy(&buf[..n.max(0) as usize])
+        },
+        None => d.text.clone(),
+    };
+    if name.trim().is_empty() {
+        if let Some(d) = &mut app.ui.dialog {
+            d.error = Some("Give it a name.".into());
+        }
+        invalidate(app.ui.hwnd);
+        return;
+    }
+    let (save, rename) = (d.save.clone(), d.rename.clone());
+    close_dialog(app);
+    if let Some(sheet) = save {
+        match app.save_preset(&sheet, &name) {
+            Ok(id) => {
+                if and_use {
+                    use_sheet(app, Active::preset(&id));
+                }
+                open_sheet(app, Sheet::Preset { id });
+            }
+            Err(e) => message(app, &format!("Could not save the preset: {e}"), true),
+        }
+    } else if let Some(id) = rename {
+        if let Err(e) = app.rename_preset(&id, &name) {
+            message(app, &format!("Could not rename the preset: {e}"), true);
+        }
+    }
+    crate::refresh_tray(app);
+}
+
+/// Enter / Esc in the text box (caught in the message loop).
+pub fn on_dialog_key(app: &mut App, vk: u16) {
+    if vk == VK_RETURN {
+        let and_use = false;
+        confirm_dialog(app, and_use, None);
+    } else if vk == VK_ESCAPE {
+        close_dialog(app);
+    }
+}
+
+fn row_menu(app: &mut App, row: &RowRef) {
     unsafe {
         let menu = CreatePopupMenu();
         let add = |id: usize, text: &str, enabled: bool| {
             let w = wide(text);
             AppendMenuW(menu, MF_STRING | if enabled { 0 } else { MF_GRAYED }, id, w.as_ptr());
         };
-        add(1, "Show cursors", ok);
-        add(2, "Use these cursors", ok);
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(3, "Show in folder", true);
-        add(4, "Remove pack", true);
-        if ok {
-            SetMenuDefaultItem(menu, 1, 0);
+        match row {
+            RowRef::Current => {
+                add(1, "Show cursors", true);
+                add(5, "Save as preset\u{2026}", true);
+            }
+            RowRef::Preset(_) => {
+                add(1, "Show cursors", true);
+                add(2, "Use these cursors", true);
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+                add(6, "Rename\u{2026}", true);
+                add(7, "Delete preset", true);
+            }
+            RowRef::Pack(archive) => {
+                let ok = app.find(archive).is_some_and(|i| !i.schemes.is_empty());
+                add(1, "Show cursors", ok);
+                add(2, "Use these cursors", ok);
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+                add(3, "Show in folder", true);
+                add(4, "Remove pack", true);
+            }
         }
+        SetMenuDefaultItem(menu, 1, 0);
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.ui.hwnd, null());
         DestroyMenu(menu);
-        match cmd {
-            1 => open_detail(app, archive),
-            2 => {
-                if let Err(e) = app.apply(Active { archive: archive.to_string(), scheme: 0 }) {
-                    message(app, &format!("Could not apply the cursors: {e}"), true);
-                }
+        match (cmd, row) {
+            (1, _) => open_row(app, row),
+            (2, RowRef::Pack(archive)) => use_sheet(app, Active::pack(archive, 0)),
+            (2, RowRef::Preset(id)) => use_sheet(app, Active::preset(id)),
+            (3, RowRef::Pack(archive)) => show_in_folder(&app.drop_dir.join(archive)),
+            (4, RowRef::Pack(archive)) => remove_pack(app, archive),
+            (5, RowRef::Current) => open_dialog(app, Some(Sheet::Current), None, "My cursors"),
+            (6, RowRef::Preset(id)) => {
+                let name = app.preset(id).map(|p| p.name.clone()).unwrap_or_default();
+                open_dialog(app, None, Some(id.clone()), &name);
             }
-            3 => show_in_folder(&app.drop_dir.join(archive)),
-            4 => remove_pack(app, archive),
+            (7, RowRef::Preset(id)) => delete_preset_asking(app, id),
             _ => {}
         }
     }
@@ -1557,7 +2351,7 @@ pub fn add_packs(app: &mut App, files: &[PathBuf]) {
     crate::rescan(app);
     if let Some(name) = last {
         if app.find(&name).is_some_and(|i| !i.schemes.is_empty()) {
-            let _ = app.apply(Active { archive: name.clone(), scheme: 0 });
+            let _ = app.apply(Active::pack(&name, 0));
             open_detail(app, &name);
         } else if let Some(err) = app.find(&name).and_then(|i| i.error.clone()) {
             message(app, &format!("{name}: {err}"), true);
@@ -1714,11 +2508,11 @@ pub fn self_test(app: &mut App, dir: &Path) {
     let multi = app.state.installed.iter().find(|i| i.schemes.len() > 1).map(|i| i.archive.clone());
     let mut shots: Vec<(&str, u8, View)> = vec![("list-light", THEME_LIGHT, View::List), ("list-dark", THEME_DARK, View::List)];
     if let Some(a) = &first {
-        shots.push(("detail-dark", THEME_DARK, View::Detail { archive: a.clone(), variant: 0 }));
-        shots.push(("detail-light", THEME_LIGHT, View::Detail { archive: a.clone(), variant: 0 }));
+        shots.push(("detail-dark", THEME_DARK, View::Detail(Sheet::Pack { archive: a.clone(), variant: 0 })));
+        shots.push(("detail-light", THEME_LIGHT, View::Detail(Sheet::Pack { archive: a.clone(), variant: 0 })));
     }
     if let Some(a) = &multi {
-        shots.push(("variants-dark", THEME_DARK, View::Detail { archive: a.clone(), variant: 1 }));
+        shots.push(("variants-dark", THEME_DARK, View::Detail(Sheet::Pack { archive: a.clone(), variant: 1 })));
     }
     for (name, theme, view) in shots {
         app.state.ui.theme = theme;
@@ -1754,11 +2548,11 @@ pub fn self_test(app: &mut App, dir: &Path) {
     apply_theme(app);
     app.ui.view = View::List;
     app.ui.theme_open = false;
-    let row = app.ui.row_order.iter().position(|a| Some(a) == first.as_ref()).unwrap_or(0);
+    let row = app.ui.row_order.iter().position(|a| matches!(a, RowRef::Pack(n) if Some(n) == first.as_ref())).unwrap_or(0);
     paint_to(app, w, h);
-    let row = app.ui.row_order.iter().position(|a| Some(a) == first.as_ref()).unwrap_or(row);
+    let row = app.ui.row_order.iter().position(|a| matches!(a, RowRef::Pack(n) if Some(n) == first.as_ref())).unwrap_or(row);
     click(app, Kind::Row, row);
-    check("click row opens its cursors", matches!(&app.ui.view, View::Detail { archive, .. } if Some(archive) == first.as_ref()));
+    check("click row opens its cursors", matches!(&app.ui.view, View::Detail(Sheet::Pack { archive, .. }) if Some(archive) == first.as_ref()));
     paint_to(app, w, h);
     on_wheel(app, (-240i32 as u32 as usize) << 16, 0, false);
     paint_to(app, w, h);
@@ -1771,9 +2565,9 @@ pub fn self_test(app: &mut App, dir: &Path) {
     check("size header sorts by size, biggest first", app.state.ui.sort_column == 3 && !app.state.ui.sort_ascending);
     click(app, Kind::ColHeader, 3);
     check("again sorts smallest first", app.state.ui.sort_ascending);
-    let sizes: Vec<u64> = app.ui.row_order.iter().filter_map(|a| app.find(a).map(|i| i.size)).collect();
+    let sizes: Vec<u64> = app.ui.row_order.iter().filter_map(|a| match a { RowRef::Pack(n) => app.find(n).map(|i| i.size), _ => None }).collect();
     paint_to(app, w, h);
-    let sizes2: Vec<u64> = app.ui.row_order.iter().filter_map(|a| app.find(a).map(|i| i.size)).collect();
+    let sizes2: Vec<u64> = app.ui.row_order.iter().filter_map(|a| match a { RowRef::Pack(n) => app.find(n).map(|i| i.size), _ => None }).collect();
     check("rows are in size order", sizes2.windows(2).all(|p| p[0] <= p[1]) && sizes.len() == sizes2.len());
     click(app, Kind::Theme, 0);
     check("theme button opens the menu", app.ui.theme_open);
@@ -1841,10 +2635,80 @@ pub fn self_test(app: &mut App, dir: &Path) {
         check(
             "the dropped pack is added, opened and used",
             app.find("Dragged Pack.zip").is_some_and(|i| !i.schemes.is_empty())
-                && matches!(&app.ui.view, View::Detail { archive, .. } if archive == "Dragged Pack.zip")
+                && matches!(&app.ui.view, View::Detail(Sheet::Pack { archive, .. }) if archive == "Dragged Pack.zip")
                 && app.state.active.as_ref().is_some_and(|a| a.archive == "Dragged Pack.zip"),
         );
         let _ = std::fs::remove_dir_all(&tmp);
+        go_list(app);
+    }
+
+    // Choosing cursors by hand: click a tile, pick from this pack or another one.
+    if let Some(a) = first.clone() {
+        app.state.ui.theme = THEME_DARK;
+        apply_theme(app);
+        open_detail(app, &a);
+        let sheet = match &app.ui.view {
+            View::Detail(s) => s.clone(),
+            View::List => Sheet::Current,
+        };
+        click(app, Kind::Tile, 0);
+        check("clicking a cursor opens the picker", app.ui.picker.as_ref().is_some_and(|p| p.role == 0 && !p.sources.is_empty()));
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("picker.png").to_string_lossy());
+        let others = app.ui.picker.as_ref().map_or(0, |p| p.sources.len());
+        if others > 1 {
+            click(app, Kind::PickerSource, 1);
+            check("another pack's cursors can be shown", app.ui.picker.as_ref().is_some_and(|p| p.source == 1));
+        }
+        click(app, Kind::PickerFile, 0);
+        check("picking a cursor closes the picker and marks the slot edited", app.ui.picker.is_none() && app.slot_edited(&sheet, 0) && app.edits(&sheet) == 1);
+        click(app, Kind::Tile, 3);
+        click(app, Kind::PickerOption, OPT_KEEP);
+        check("Keep current is a choice too", app.slot(&sheet, 3) == Slot::Keep && app.edits(&sheet) == 2);
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("edited.png").to_string_lossy());
+        click(app, Kind::Button, BTN_RESET);
+        check("Reset changes puts the pack back", app.edits(&sheet) == 0);
+
+        // Current cursors: change one, save as a preset and use it.
+        go_list(app);
+        click(app, Kind::Row, 0);
+        check("the first row is Current cursors", app.ui.view == View::Detail(Sheet::Current));
+        click(app, Kind::Tile, 14);
+        click(app, Kind::PickerFile, 0);
+        check("changing Current makes a draft", app.edits(&Sheet::Current) == 1);
+        click(app, Kind::Button, BTN_SAVE_PRESET);
+        check("Save as preset opens the name dialog", app.ui.dialog.as_ref().is_some_and(|d| d.save == Some(Sheet::Current)));
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("save-dialog.png").to_string_lossy());
+        confirm_dialog(app, true, Some("Test preset"));
+        let id = app.presets().iter().find(|p| p.name == "Test preset").map(|p| p.id.clone());
+        check("the preset is saved and its files copied", id.as_ref().is_some_and(|id| {
+            let p = app.preset(id).unwrap();
+            p.picks.iter().all(|k| match k {
+                Pick::File(f) => app.presets_dir().join(id).join(f).is_file(),
+                _ => true,
+            }) && p.picks.iter().any(|k| matches!(k, Pick::File(_)))
+        }));
+        check("the draft is cleared once saved", app.edits(&Sheet::Current) == 0);
+        if let Some(id) = id {
+            check("Save and use applies the preset and opens it", app.state.active.as_ref().is_some_and(|a| a.preset.as_deref() == Some(id.as_str()))
+                && app.ui.view == View::Detail(Sheet::Preset { id: id.clone() }));
+            paint_to(app, w, h);
+            app.ui.canvas.as_ref().unwrap().save_png(&dir.join("preset.png").to_string_lossy());
+            go_list(app);
+            paint_to(app, w, h);
+            check("presets are listed after Current", app.ui.row_order.get(1) == Some(&RowRef::Preset(id.clone())));
+            app.state.ui.theme = THEME_LIGHT;
+            apply_theme(app);
+            paint_to(app, w, h);
+            app.ui.canvas.as_ref().unwrap().save_png(&dir.join("list-presets.png").to_string_lossy());
+            open_dialog(app, None, Some(id.clone()), "Test preset");
+            confirm_dialog(app, false, Some("Renamed preset"));
+            check("presets can be renamed", app.preset(&id).is_some_and(|p| p.name == "Renamed preset"));
+            app.delete_preset(&id);
+            check("and deleted (files and all)", app.preset(&id).is_none() && !app.presets_dir().join(&id).exists() && app.state.active.is_none());
+        }
         go_list(app);
     }
 
@@ -1892,10 +2756,10 @@ pub fn self_test(app: &mut App, dir: &Path) {
     app.ui.canvas.as_ref().unwrap().save_png(&dir.join("tabs-end.png").to_string_lossy());
     on_key(app, VK_RIGHT);
     settle(app);
-    check("right key picks the next variant and scrolls back to it", matches!(app.ui.view, View::Detail { variant: 1, .. }) && app.ui.tabs.scroll < app.ui.tabs.max);
+    check("right key picks the next variant and scrolls back to it", matches!(app.ui.view, View::Detail(Sheet::Pack { variant: 1, .. })) && app.ui.tabs.scroll < app.ui.tabs.max);
     on_key(app, VK_LEFT);
     settle(app);
-    check("left key picks the previous variant and scrolls to it", matches!(app.ui.view, View::Detail { variant: 0, .. }) && app.ui.tabs.scroll == 0.0);
+    check("left key picks the previous variant and scrolls to it", matches!(app.ui.view, View::Detail(Sheet::Pack { variant: 0, .. })) && app.ui.tabs.scroll == 0.0);
     // Hover a tab whose name is cut off: it grows to show the full name.
     paint_to(app, w, h);
     if let Some(e) = app.ui.elems.iter().find(|e| e.kind == Kind::Segment && e.id == 2) {
