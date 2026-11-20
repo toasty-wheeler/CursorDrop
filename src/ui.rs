@@ -9,7 +9,11 @@ use crate::cursors::{self, wide};
 use crate::gfx::*;
 use crate::scheme::{ROLE_LABELS, ROLES, Scheme};
 use crate::edit::{Pick, PickSource, Sheet, Slot};
+use crate::schedule::DayRule;
 use crate::{Active, App, Installed};
+
+#[path = "ui_schedule.rs"]
+mod schedule_view;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,6 +70,7 @@ const BTN_DELETE_PRESET: usize = 10;
 const BTN_DIALOG_CANCEL: usize = 11;
 const BTN_DIALOG_SAVE: usize = 12;
 const BTN_DIALOG_SAVE_USE: usize = 13;
+const BTN_SCHED_CLEAR: usize = 14;
 
 // Picker options.
 const OPT_KEEP: usize = 0;
@@ -116,6 +121,8 @@ pub enum View {
     List,
     /// The cursor grid of a pack variant, of the cursors in use, or of a preset.
     Detail(Sheet),
+    /// The schedule: a calendar and the cursors for each day of the pattern.
+    Schedule,
 }
 
 /// A row of the list.
@@ -149,6 +156,18 @@ enum Kind {
     PickerSource,
     PickerFile,
     DialogVeil,
+    // The schedule page.
+    SchedOpen,
+    CalPrev,
+    CalNext,
+    CalToday,
+    CalDay,
+    QuickSel,
+    Task,
+    AddWeek,
+    RemoveWeek,
+    Mode,
+    Choice,
 }
 
 type Hit = (Kind, usize);
@@ -218,7 +237,8 @@ pub struct Ui {
     theme_open: bool,
     pub dark: bool,
     accent: Color,
-    knobs: [f32; 2],
+    knobs: [f32; 3],
+    pub sched: schedule_view::SchedUi,
     /// Files being dragged over the window (None when nothing is), what the overlay last
     /// showed (kept while it fades out), and how far it has faded in.
     drag: Option<DragInfo>,
@@ -301,7 +321,8 @@ impl Default for Ui {
             theme_open: false,
             dark: false,
             accent: argb(255, 10, 132, 255),
-            knobs: [-1.0; 2],
+            knobs: [-1.0; 3],
+            sched: Default::default(),
             drag: None,
             drag_shown: None,
             drag_t: 0.0,
@@ -525,6 +546,8 @@ struct Model {
     current_preview: Vec<String>,
     current_edits: usize,
     sheet: Option<SheetView>,
+    sched: Option<schedule_view::SchedModel>,
+    schedule_on: bool,
     active: Option<Active>,
     startup: bool,
     can_restore: bool,
@@ -599,14 +622,17 @@ impl Model {
             .collect();
         let sheet = match &app.ui.view {
             View::Detail(sheet) => sheet_view(app, sheet, active.as_ref(), &now),
-            View::List => None,
+            _ => None,
         };
+        let sched = (app.ui.view == View::Schedule).then(|| schedule_view::SchedModel::new(app));
         Model {
             packs,
             presets,
             current_preview,
             current_edits: app.edits(&Sheet::Current),
             sheet,
+            sched,
+            schedule_on: app.state.schedule.enabled,
             active,
             startup: app.startup_enabled(),
             can_restore: current && app.state.backup.is_some(),
@@ -869,7 +895,7 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
     let ui = &mut app.ui;
 
     // Switch knobs ease towards their state; the drop overlay fades in and out.
-    for (knob, on) in ui.knobs.iter_mut().zip([model.startup, model.close_to_tray]) {
+    for (knob, on) in ui.knobs.iter_mut().zip([model.startup, model.close_to_tray, model.schedule_on]) {
         let goal = if on { 1.0 } else { 0.0 };
         if *knob < 0.0 {
             *knob = goal;
@@ -923,7 +949,7 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
         View::List => {
             draw_list_header(&mut pt, &model, m);
             draw_list(&mut pt, ui, &model, content);
-            draw_list_footer(&mut pt, &model, ui.knobs, w, h);
+            draw_list_footer(&mut pt, &model, [ui.knobs[0], ui.knobs[1]], w, h);
         }
         View::Detail(_) => {
             if let Some(sv) = &model.sheet {
@@ -931,11 +957,29 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
                 draw_detail_footer(&mut pt, sv, w, h);
             }
         }
+        View::Schedule => {
+            if let Some(sm) = &model.sched {
+                schedule_view::draw(&mut pt, &mut ui.sched, sm, content, m);
+                draw_schedule_footer(&mut pt, ui.knobs[2], model.schedule_on, w, h);
+            }
+        }
     }
 
     // On-top pin and theme, top right, as in DS4-Native.
     let pin = R::new(theme_btn.x - pt.s(46.0), theme_btn.y, pt.s(36.0), pt.s(36.0));
     pt.icon_button(pin, Kind::Pin, if model.on_top { G_PINNED } else { G_PIN }, None, model.on_top);
+    if ui.view == View::List {
+        // The schedule, with a dot when it's on.
+        let r = R::new(pin.x - pt.s(10.0) - pt.s(122.0), pin.y, pt.s(122.0), pin.h);
+        let hovered = pt.add(Kind::SchedOpen, 0, r);
+        pt.g.fill_round(r, pt.s(10.0), if hovered { p.hover } else { with_alpha(p.card, 255) });
+        pt.g.stroke_round(r, pt.s(10.0), p.line, pt.s(1.0));
+        pt.g.text(schedule_view::G_CALENDAR, &pt.f.icon, if model.schedule_on { pt.accent } else { p.text }, R::new(r.x + pt.s(10.0), r.y, pt.s(20.0), r.h), Align::Center, Align::Center);
+        pt.g.label("Schedule", &pt.f.caption, p.text, R::new(r.x + pt.s(36.0), r.y, r.w - pt.s(50.0), r.h));
+        if model.schedule_on {
+            pt.g.ellipse(r.right() - pt.s(20.0), r.y + r.h / 2.0 - pt.s(4.0), pt.s(8.0), pt.s(8.0), pt.accent);
+        }
+    }
     let theme_glyph = match model.theme {
         THEME_LIGHT => G_SUN,
         THEME_DARK => G_MOON,
@@ -1271,6 +1315,17 @@ fn draw_list_footer(pt: &mut Painter, model: &Model, knobs: [f32; 2], w: f32, h:
             (BTN_ADD, "Add pack\u{2026}", true, true),
         ],
     );
+}
+
+/// The schedule's footer: the switch that turns it on, and Clear schedule.
+fn draw_schedule_footer(pt: &mut Painter, knob: f32, on: bool, w: f32, h: f32) {
+    let footer = R::new(pt.s(MARGIN), h - pt.s(FOOTER_H), w - 2.0 * pt.s(MARGIN), pt.s(FOOTER_H) - pt.s(16.0));
+    pt.g.fill_round(footer, pt.s(12.0), pt.p.card);
+    let detail = if on { "Changes your cursors each day" } else { "Off: your cursors stay as they are" };
+    pt.toggle_row(R::new(footer.x, footer.y, pt.s(300.0), footer.h), 2, "Follow the schedule", detail, knob);
+    let bw = pt.s(140.0);
+    let r = R::new(footer.right() - pt.s(12.0) - bw, footer.y + (footer.h - pt.s(32.0)) / 2.0, bw, pt.s(32.0));
+    pt.button(r, BTN_SCHED_CLEAR, "Clear schedule", false, true);
 }
 
 /// The grid's footer: secondary actions on the left, the main ones on the right.
@@ -1814,6 +1869,10 @@ pub fn on_wheel(app: &mut App, wp: WPARAM, lp: LPARAM, horizontal: bool) {
             }
         }
     } else if ui.dialog.is_some() {
+    } else if ui.view == View::Schedule {
+        if !horizontal {
+            schedule_view::wheel(&mut ui.sched, mx, my, step);
+        }
     } else if ui.tabs.max > 0.0 && ui.tabs.area.contains(mx, my) {
         let tabs = &mut ui.tabs;
         let step = delta / 120.0 * tabs.tab_w * 0.8;
@@ -1951,6 +2010,7 @@ fn action(app: &mut App, (kind, id): Hit) {
             app.save();
         }
         Kind::Toggle if id == 0 => app.toggle_startup(),
+        Kind::Toggle if id == 2 => app.toggle_schedule(),
         Kind::Toggle => {
             app.state.ui.close_to_tray = !app.state.ui.close_to_tray;
             app.save();
@@ -1960,6 +2020,15 @@ fn action(app: &mut App, (kind, id): Hit) {
         Kind::TabNext => app.ui.tabs.target = (app.ui.tabs.target + app.ui.tabs.tab_w * 2.0).min(app.ui.tabs.max),
         Kind::Button => button(app, id),
         Kind::Tile => open_picker(app, id),
+        Kind::SchedOpen => {
+            app.ui.view = View::Schedule;
+            app.ui.sched.month = (0, 0);
+            app.ui.sched.sel.clear();
+            app.ui.hover = None;
+        }
+        Kind::CalPrev | Kind::CalNext | Kind::CalToday | Kind::CalDay | Kind::QuickSel | Kind::Task | Kind::AddWeek | Kind::RemoveWeek | Kind::Mode | Kind::Choice => {
+            schedule_view::action(app, kind, id)
+        }
         Kind::PickerVeil if id == 0 => app.ui.picker = None,
         Kind::PickerClose => app.ui.picker = None,
         Kind::PickerOption => match id {
@@ -1989,7 +2058,7 @@ fn action(app: &mut App, (kind, id): Hit) {
 fn detail_sheet(app: &App) -> Option<Sheet> {
     match &app.ui.view {
         View::Detail(sheet) => Some(sheet.clone()),
-        View::List => None,
+        _ => None,
     }
 }
 
@@ -2020,6 +2089,18 @@ fn button(app: &mut App, id: usize) {
             open_dialog(app, None, Some(id), &name);
         }
         (BTN_DELETE_PRESET, Some(Sheet::Preset { id })) => delete_preset_asking(app, &id),
+        (BTN_SCHED_CLEAR, _) => {
+            let t = wide("CursorDrop");
+            let q = wide("Clear the whole schedule?
+
+Every day goes back to \"No change\" and extra weeks are removed.");
+            if unsafe { MessageBoxW(app.ui.hwnd, q.as_ptr(), t.as_ptr(), MB_YESNO | MB_ICONQUESTION) } == IDYES {
+                let enabled = app.state.schedule.enabled;
+                app.state.schedule = crate::schedule::Schedule { enabled, ..Default::default() };
+                app.ui.sched.sel.clear();
+                app.save();
+            }
+        }
         (BTN_DIALOG_CANCEL, _) => close_dialog(app),
         (BTN_DIALOG_SAVE, _) => confirm_dialog(app, false, None),
         (BTN_DIALOG_SAVE_USE, _) => confirm_dialog(app, true, None),
@@ -2479,7 +2560,7 @@ fn draw_drop_overlay(pt: &mut Painter, info: &DragInfo, t: f32, w: f32, h: f32) 
 /// Called ~30 times a second while the window is visible: animates .ani cursors, switches,
 /// the tab strip and the drop overlay.
 pub fn on_anim_tick(app: &mut App) {
-    let goals = [app.startup_enabled(), app.state.ui.close_to_tray];
+    let goals = [app.startup_enabled(), app.state.ui.close_to_tray, app.state.schedule.enabled];
     let knobs_moving = app.ui.knobs.iter().zip(goals).any(|(k, on)| (k - if on { 1.0 } else { 0.0 }).abs() > 0.001);
     let tabs_moving = (app.ui.tabs.scroll - app.ui.tabs.target).abs() > 0.01;
     let overlay = app.ui.drag.is_some() || app.ui.drag_t > 0.0;
@@ -2652,7 +2733,7 @@ pub fn self_test(app: &mut App, dir: &Path) {
         open_detail(app, &a);
         let sheet = match &app.ui.view {
             View::Detail(s) => s.clone(),
-            View::List => Sheet::Current,
+            _ => Sheet::Current,
         };
         click(app, Kind::Tile, 0);
         check("clicking a cursor opens the picker", app.ui.picker.as_ref().is_some_and(|p| p.role == 0 && !p.sources.is_empty()));
@@ -2712,6 +2793,57 @@ pub fn self_test(app: &mut App, dir: &Path) {
             app.delete_preset(&id);
             check("and deleted (files and all)", app.preset(&id).is_none() && !app.presets_dir().join(&id).exists() && app.state.active.is_none());
         }
+        go_list(app);
+    }
+
+    // The schedule: Weekdays get one set, a second week's weekend picks at random.
+    {
+        app.state.ui.theme = THEME_LIGHT;
+        apply_theme(app);
+        go_list(app);
+        click(app, Kind::SchedOpen, 0);
+        check("the Schedule button opens the calendar", app.ui.view == View::Schedule);
+        click(app, Kind::QuickSel, 0);
+        check("Weekdays selects Monday to Friday", app.ui.sched.sel == vec![0, 1, 2, 3, 4]);
+        click(app, Kind::Mode, 1);
+        click(app, Kind::Choice, 0);
+        let first_choice = app.ui.sched.choices.first().cloned();
+        check(
+            "picking one set gives it to all of them",
+            (0..5).all(|d| matches!(app.state.schedule.rule(d), DayRule::One { pick: Some(a) } if Some(a) == first_choice.as_ref())),
+        );
+        check("the day list calls them Weekdays", crate::schedule::week_groups(&app.state.schedule.weeks[0])[0].0 == vec![0, 1, 2, 3, 4]);
+        click(app, Kind::AddWeek, 0);
+        check("+ adds week 2 and selects its weekend", app.state.schedule.weeks.len() == 2 && app.ui.sched.sel == vec![12, 13]);
+        click(app, Kind::Mode, 2);
+        click(app, Kind::Choice, 1);
+        click(app, Kind::Choice, 2);
+        check("Random pick ticks several", matches!(app.state.schedule.rule(12), DayRule::Several { picks } if picks.len() == 2));
+        check("the selection reads Weekends in week 2", crate::schedule::describe_slots(&app.ui.sched.sel, 2) == "Weekends in week 2");
+        // Tapping dates toggles their day of the pattern.
+        app.ui.sched.sel.clear();
+        paint_to(app, w, h);
+        let idx = app.ui.sched.cal_days.iter().position(|d| crate::schedule::weekday(*d) == 2).unwrap_or(0);
+        click(app, Kind::CalDay, idx);
+        check("tapping a date selects its day", app.ui.sched.sel.len() == 1);
+        click(app, Kind::CalDay, idx);
+        check("tapping it again unselects it", app.ui.sched.sel.is_empty());
+        click(app, Kind::QuickSel, 0);
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-light.png").to_string_lossy());
+        click(app, Kind::Toggle, 2);
+        let today = crate::schedule::today();
+        let expect = app.state.schedule.rule(app.state.schedule.slot_of(today)).clone();
+        let picked = app.state.schedule.today.clone();
+        check("turning it on applies today's cursors", app.state.schedule.enabled && picked.as_ref().is_some_and(|(d, p)| *d == today && (expect == DayRule::Off) == p.is_none()));
+        app.state.ui.theme = THEME_DARK;
+        apply_theme(app);
+        app.ui.sched.sel = vec![12, 13];
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-dark.png").to_string_lossy());
+        click(app, Kind::RemoveWeek, 1);
+        check("weeks can be removed again", app.state.schedule.weeks.len() == 1);
+        app.state.schedule = Default::default();
         go_list(app);
     }
 

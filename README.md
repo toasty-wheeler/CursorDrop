@@ -38,6 +38,12 @@ unzip it anywhere and run `CursorDrop.exe`. It's portable: no installer and no a
   any of its cursors (or a pack's) and **Save as preset…**: the cursors are copied into the
   preset, so it keeps working even if the packs are removed. Presets can be used, changed,
   renamed and deleted like packs, and are in the tray menu too.
+- **Schedule:** the **Schedule** button opens a calendar. Select days (tap dates, or
+  **Weekdays** / **Weekends** / **Every day**) and give them **One** set of cursors, a
+  **Random pick** from several, **Random from all**, or **No change**; packs and presets can
+  both be used. **+** under the last weekend adds another week (up to 5), so the pattern
+  repeats every 2-5 weeks. With **Follow the schedule** on, each new day gets its cursors
+  (a random pick stays the same all day).
 - **Variants:** packs with several versions (sizes, colours, characters…) get browser-style
   tabs, named after their folders. Many variants scroll: use the arrows, the mouse wheel
   over the tabs, or Left / Right. Hover a tab to see its full name.

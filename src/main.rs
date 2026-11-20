@@ -8,6 +8,7 @@ mod cursors;
 mod dragdrop;
 mod edit;
 mod gfx;
+mod schedule;
 mod scheme;
 mod ui;
 
@@ -47,6 +48,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const CMD_SHOW: usize = 6;
+const CMD_SCHEDULE: usize = 7;
 const CMD_OPEN: usize = 1;
 const CMD_RESCAN: usize = 2;
 const CMD_RESTORE: usize = 3;
@@ -72,6 +74,8 @@ struct State {
     current_draft: std::collections::BTreeMap<usize, edit::Pick>,
     #[serde(default)]
     presets: Vec<edit::Preset>,
+    #[serde(default)]
+    schedule: schedule::Schedule,
 }
 
 /// Bump when extraction or scheme naming changes: installed packs are then re-extracted once.
@@ -569,6 +573,8 @@ fn show_menu(app: &mut App) {
         append(menu, MF_STRING, CMD_RESCAN, "Rescan now");
         let can_restore = current && app.state.backup.is_some();
         append(menu, MF_STRING | if can_restore { 0 } else { MF_GRAYED }, CMD_RESTORE, "Restore original cursors");
+        let sc = if app.state.schedule.enabled { MF_CHECKED } else { MF_UNCHECKED };
+        append(menu, MF_STRING | sc, CMD_SCHEDULE, "Follow the schedule");
         let st = if app.startup_enabled() { MF_CHECKED } else { MF_UNCHECKED };
         append(menu, MF_STRING | st, CMD_STARTUP, "Start with Windows");
         append(menu, MF_SEPARATOR, 0, "");
@@ -615,6 +621,7 @@ fn run_command(app: &mut App, cmd: usize) {
             Err(e) => balloon(app, &e, true),
         },
         CMD_STARTUP => app.toggle_startup(),
+        CMD_SCHEDULE => app.toggle_schedule(),
         CMD_EXIT => unsafe {
             DestroyWindow(app.hwnd);
         },
@@ -658,6 +665,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if !app.window_visible() || err {
                         balloon(app, &m, err);
                     }
+                }
+                // A new day: the schedule picks its cursors.
+                if let Some(name) = app.run_schedule(false) {
+                    balloon(app, &format!("Today's cursors: {name}"), false);
                 }
                 refresh_tray(app);
             });
