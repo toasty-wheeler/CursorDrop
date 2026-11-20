@@ -1,8 +1,12 @@
 //! The schedule: which cursors to use on which day.
 //!
-//! It is a repeating pattern of 1 to 5 weeks (Monday to Sunday). Week 1 starts on `anchor`
-//! (a Monday), so with two weeks the pattern goes Week 1, Week 2, Week 1, ... Each day of the
-//! pattern has a rule: leave the cursors alone, use one pack variant or preset, pick at
+//! A pattern of 1 to 5 weeks (Monday to Sunday) that repeats every month: week 1 is each
+//! weekday's first time in the month (the 1st to 7th), week 2 the 8th to 14th, and so on up to
+//! week 5 (the 29th to 31st). With fewer weeks the rows take turns within the month (with two
+//! weeks, weeks 1, 3 and 5 use the first row). Special days (a month and day, e.g. December
+//! 25) repeat every year and win over the weeks.
+//!
+//! Each day has a rule: leave the cursors alone, use one pack variant or preset, pick at
 //! random between several, or pick at random from everything. Once a day has started its
 //! pick is kept for the rest of that day (also across restarts).
 
@@ -11,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const MAX_WEEKS: usize = 5;
+/// Selection / slot numbers from here on are special days (SPECIAL + index).
+pub const SPECIAL: usize = 1000;
 pub const DAY_NAMES: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 pub const DAY_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 pub const MONTHS: [&str; 12] =
@@ -30,12 +36,20 @@ pub enum DayRule {
     RandomAll,
 }
 
+/// A date that gets its own cursors every year.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpecialDay {
+    pub month: u32,
+    pub day: u32,
+    pub rule: DayRule,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub enabled: bool,
-    /// The Monday Week 1 starts on (days since 1970-01-01).
-    pub anchor: i64,
     pub weeks: Vec<[DayRule; 7]>,
+    #[serde(default)]
+    pub special: Vec<SpecialDay>,
     /// The day the schedule last ran and what it picked (kept so a random pick lasts all day).
     #[serde(default)]
     pub today: Option<(i64, Option<Active>)>,
@@ -43,8 +57,7 @@ pub struct Schedule {
 
 impl Default for Schedule {
     fn default() -> Self {
-        let t = today();
-        Schedule { enabled: false, anchor: t - weekday(t) as i64, weeks: vec![Default::default()], today: None }
+        Schedule { enabled: false, weeks: vec![Default::default()], special: vec![], today: None }
     }
 }
 
@@ -94,27 +107,73 @@ pub fn today() -> i64 {
     days_from_civil(t.wYear as i64, t.wMonth as u32, t.wDay as u32)
 }
 
+/// Days in a month; February has 29 so February 29 can be picked (it then only comes in leap years).
+pub fn days_in_month_any_year(m: u32) -> u32 {
+    match m {
+        2 => 29,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// "December 25".
+pub fn date_name(month: u32, day: u32) -> String {
+    format!("{} {day}", MONTHS[(month.clamp(1, 12) - 1) as usize])
+}
+
 impl Schedule {
-    /// Which week of the pattern a date falls in.
+    /// Which week of the month a date is in (0-4: the 1st-7th, 8th-14th, ...), as the row of
+    /// the pattern it uses.
     pub fn week_of(&self, days: i64) -> usize {
-        let monday = days - weekday(days) as i64;
-        ((monday - self.anchor) / 7).rem_euclid(self.weeks.len().max(1) as i64) as usize
+        let (_, _, d) = civil_from_days(days);
+        ((d as usize - 1) / 7) % self.weeks.len().max(1)
     }
 
-    /// The pattern day (week * 7 + weekday) for a date.
-    pub fn slot_of(&self, days: i64) -> usize {
+    /// The special day that falls on a date, if any.
+    pub fn special_on(&self, days: i64) -> Option<usize> {
+        let (_, m, d) = civil_from_days(days);
+        self.special.iter().position(|s| s.month == m && s.day == d)
+    }
+
+    /// The pattern day (week * 7 + weekday) a date uses, ignoring special days.
+    pub fn pattern_slot_of(&self, days: i64) -> usize {
         self.week_of(days) * 7 + weekday(days)
+    }
+
+    /// What decides a date: its special day, or its pattern day.
+    pub fn slot_of(&self, days: i64) -> usize {
+        match self.special_on(days) {
+            Some(i) => SPECIAL + i,
+            None => self.pattern_slot_of(days),
+        }
     }
 
     pub fn rule(&self, slot: usize) -> &DayRule {
         static OFF: DayRule = DayRule::Off;
+        if slot >= SPECIAL {
+            return self.special.get(slot - SPECIAL).map_or(&OFF, |s| &s.rule);
+        }
         self.weeks.get(slot / 7).map_or(&OFF, |w| &w[slot % 7])
     }
 
     pub fn set_rule(&mut self, slot: usize, rule: DayRule) {
-        if let Some(w) = self.weeks.get_mut(slot / 7) {
+        if slot >= SPECIAL {
+            if let Some(s) = self.special.get_mut(slot - SPECIAL) {
+                s.rule = rule;
+            }
+        } else if let Some(w) = self.weeks.get_mut(slot / 7) {
             w[slot % 7] = rule;
         }
+    }
+
+    /// Adds (or finds) a special day, keeping them in date order; returns its slot.
+    pub fn add_special(&mut self, month: u32, day: u32) -> usize {
+        if let Some(i) = self.special.iter().position(|s| s.month == month && s.day == day) {
+            return SPECIAL + i;
+        }
+        self.special.push(SpecialDay { month, day, rule: DayRule::One { pick: None } });
+        self.special.sort_by_key(|s| (s.month, s.day));
+        SPECIAL + self.special.iter().position(|s| s.month == month && s.day == day).unwrap()
     }
 }
 
@@ -162,8 +221,22 @@ pub fn describe_days(days: &[usize]) -> String {
     parts.join(", ")
 }
 
-/// Describes a selection of pattern days ("Weekdays", "Weekends in week 2", ...).
-pub fn describe_slots(slots: &[usize], weeks: usize) -> String {
+/// Describes a selection ("Weekdays", "Weekends in week 2", "December 25", ...).
+pub fn describe_slots(slots: &[usize], weeks: usize, special: &[SpecialDay]) -> String {
+    let dates: Vec<String> = slots.iter().filter(|s| **s >= SPECIAL).filter_map(|s| special.get(s - SPECIAL)).map(|s| date_name(s.month, s.day)).collect();
+    let pattern: Vec<usize> = slots.iter().copied().filter(|s| *s < SPECIAL).collect();
+    let days = describe_pattern(&pattern, weeks);
+    match (days.is_empty(), dates.is_empty()) {
+        (_, true) => days,
+        (true, false) => dates.join(", "),
+        (false, false) => format!("{days}; {}", dates.join(", ")),
+    }
+}
+
+fn describe_pattern(slots: &[usize], weeks: usize) -> String {
+    if slots.is_empty() {
+        return String::new();
+    }
     let per_week: Vec<Vec<usize>> = (0..weeks).map(|w| slots.iter().filter(|s| *s / 7 == w).map(|s| s % 7).collect()).collect();
     if weeks <= 1 {
         return describe_days(&per_week[0]);
@@ -354,20 +427,35 @@ mod tests {
         assert_eq!(describe_days(&[0, 2]), "Mon, Wed");
         assert_eq!(describe_days(&[0, 1, 2, 3, 4, 5]), "Weekdays, Sat");
         assert_eq!(describe_days(&[2]), "Wednesday");
-        assert_eq!(describe_slots(&[0, 1, 2, 3, 4, 7, 8, 9, 10, 11], 2), "Weekdays, every week");
-        assert_eq!(describe_slots(&[12, 13], 2), "Weekends in week 2");
+        assert_eq!(describe_slots(&[0, 1, 2, 3, 4, 7, 8, 9, 10, 11], 2, &[]), "Weekdays, every week");
+        assert_eq!(describe_slots(&[12, 13], 2, &[]), "Weekends in week 2");
+        let xmas = [SpecialDay { month: 12, day: 25, rule: DayRule::RandomAll }];
+        assert_eq!(describe_slots(&[SPECIAL], 1, &xmas), "December 25");
+        assert_eq!(describe_slots(&[5, 6, SPECIAL], 1, &xmas), "Weekends; December 25");
     }
 
     #[test]
     fn rotation() {
-        let mut s = Schedule { enabled: true, anchor: days_from_civil(2026, 11, 16), weeks: vec![Default::default(); 2], today: None };
-        let mon = days_from_civil(2026, 11, 16);
-        assert_eq!(s.week_of(mon), 0);
-        assert_eq!(s.week_of(mon + 7), 1);
-        assert_eq!(s.week_of(mon + 14), 0);
-        assert_eq!(s.week_of(mon - 1), 1); // the Sunday before is in week 2's place
-        s.weeks.push(Default::default());
-        assert_eq!(s.week_of(mon + 14), 2);
+        // Weeks of the month: the 1st-7th are week 1, the 8th-14th week 2, ... (Nov 2026).
+        let mut s = Schedule { enabled: true, weeks: vec![Default::default(); 5], ..Default::default() };
+        let d = |day| days_from_civil(2026, 11, day);
+        assert_eq!(s.week_of(d(1)), 0);
+        assert_eq!(s.week_of(d(7)), 0);
+        assert_eq!(s.week_of(d(8)), 1);
+        assert_eq!(s.week_of(d(29)), 4);
+        assert_eq!(s.slot_of(d(20)), 2 * 7 + 4); // the third Friday
+        // With two weeks the rows take turns: weeks 1, 3 and 5 use the first.
+        s.weeks.truncate(2);
+        assert_eq!(s.week_of(d(15)), 0);
+        assert_eq!(s.week_of(d(22)), 1);
+        assert_eq!(s.week_of(d(30)), 0);
+        // A special day wins and comes back every year.
+        let slot = s.add_special(12, 25);
+        assert_eq!(slot, SPECIAL);
+        assert_eq!(s.slot_of(days_from_civil(2027, 12, 25)), SPECIAL);
+        s.set_rule(slot, DayRule::RandomAll);
+        assert_eq!(*s.rule(s.slot_of(days_from_civil(2030, 12, 25))), DayRule::RandomAll);
+        assert_eq!(s.add_special(1, 1), SPECIAL); // kept in date order
         let groups = week_groups(&[
             DayRule::Off, DayRule::Off, DayRule::Off, DayRule::Off, DayRule::Off, DayRule::RandomAll, DayRule::RandomAll,
         ]);

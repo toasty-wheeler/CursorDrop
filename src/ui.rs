@@ -160,7 +160,10 @@ enum Kind {
     SchedOpen,
     CalPrev,
     CalNext,
-    CalToday,
+    PatternCell,
+    AddSpecial,
+    RemoveSpecial,
+    DateVeil,
     CalDay,
     QuickSel,
     Task,
@@ -959,7 +962,7 @@ fn paint(app: &mut App, dc: HDC, w: f32, h: f32) {
         }
         View::Schedule => {
             if let Some(sm) = &model.sched {
-                schedule_view::draw(&mut pt, &mut ui.sched, sm, content, m);
+                schedule_view::draw(&mut pt, &mut ui.sched, sm, content, m, w, h);
                 draw_schedule_footer(&mut pt, ui.knobs[2], model.schedule_on, w, h);
             }
         }
@@ -1895,6 +1898,7 @@ pub fn on_key(app: &mut App, vk: u16) {
     let back = vk == VK_ESCAPE || vk == VK_BACK;
     if back && app.ui.picker.is_some() {
         app.ui.picker = None;
+    } else if back && app.ui.view == View::Schedule && schedule_view::escape(&mut app.ui.sched) {
     } else if back && app.ui.theme_open {
         app.ui.theme_open = false;
     } else if back && app.ui.view != View::List {
@@ -2022,11 +2026,23 @@ fn action(app: &mut App, (kind, id): Hit) {
         Kind::Tile => open_picker(app, id),
         Kind::SchedOpen => {
             app.ui.view = View::Schedule;
-            app.ui.sched.month = (0, 0);
+            app.ui.sched.date_picker = None;
             app.ui.sched.sel.clear();
             app.ui.hover = None;
         }
-        Kind::CalPrev | Kind::CalNext | Kind::CalToday | Kind::CalDay | Kind::QuickSel | Kind::Task | Kind::AddWeek | Kind::RemoveWeek | Kind::Mode | Kind::Choice => {
+        Kind::CalPrev
+        | Kind::CalNext
+        | Kind::CalDay
+        | Kind::PatternCell
+        | Kind::QuickSel
+        | Kind::Task
+        | Kind::AddWeek
+        | Kind::RemoveWeek
+        | Kind::AddSpecial
+        | Kind::RemoveSpecial
+        | Kind::DateVeil
+        | Kind::Mode
+        | Kind::Choice => {
             schedule_view::action(app, kind, id)
         }
         Kind::PickerVeil if id == 0 => app.ui.picker = None,
@@ -2819,15 +2835,33 @@ pub fn self_test(app: &mut App, dir: &Path) {
         click(app, Kind::Choice, 1);
         click(app, Kind::Choice, 2);
         check("Random pick ticks several", matches!(app.state.schedule.rule(12), DayRule::Several { picks } if picks.len() == 2));
-        check("the selection reads Weekends in week 2", crate::schedule::describe_slots(&app.ui.sched.sel, 2) == "Weekends in week 2");
-        // Tapping dates toggles their day of the pattern.
+        check("the selection reads Weekends in week 2", crate::schedule::describe_slots(&app.ui.sched.sel, 2, &[]) == "Weekends in week 2");
+        // Tapping days in the weeks toggles them.
         app.ui.sched.sel.clear();
-        paint_to(app, w, h);
-        let idx = app.ui.sched.cal_days.iter().position(|d| crate::schedule::weekday(*d) == 2).unwrap_or(0);
-        click(app, Kind::CalDay, idx);
-        check("tapping a date selects its day", app.ui.sched.sel.len() == 1);
-        click(app, Kind::CalDay, idx);
+        click(app, Kind::PatternCell, 9);
+        check("tapping a day in the weeks selects it", app.ui.sched.sel == vec![9]);
+        click(app, Kind::PatternCell, 9);
         check("tapping it again unselects it", app.ui.sched.sel.is_empty());
+        // A special date, every year.
+        app.ui.sched.list_scroll = f32::MAX; // the button is at the bottom of the day list
+        click(app, Kind::AddSpecial, 0);
+        check("Add a date opens the date picker", app.ui.sched.date_picker.is_some());
+        for _ in 0..12 {
+            if app.ui.sched.date_picker == Some(12) || app.ui.sched.date_picker.is_none() {
+                break;
+            }
+            click(app, Kind::CalNext, 0);
+        }
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("date-picker.png").to_string_lossy());
+        click(app, Kind::CalDay, 25);
+        let xmas = crate::schedule::SPECIAL;
+        check("picking December 25 adds it and selects it", app.state.schedule.special.len() == 1 && app.ui.sched.sel == vec![xmas] && app.ui.sched.date_picker.is_none());
+        click(app, Kind::Mode, 3);
+        let next_xmas = crate::schedule::days_from_civil(2031, 12, 25);
+        check("the date gets its own cursors every year", *app.state.schedule.rule(app.state.schedule.slot_of(next_xmas)) == DayRule::RandomAll);
+        paint_to(app, w, h);
+        app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-special.png").to_string_lossy());
         click(app, Kind::QuickSel, 0);
         paint_to(app, w, h);
         app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-light.png").to_string_lossy());
@@ -2843,6 +2877,8 @@ pub fn self_test(app: &mut App, dir: &Path) {
         app.ui.canvas.as_ref().unwrap().save_png(&dir.join("schedule-dark.png").to_string_lossy());
         click(app, Kind::RemoveWeek, 1);
         check("weeks can be removed again", app.state.schedule.weeks.len() == 1);
+        click(app, Kind::RemoveSpecial, 0);
+        check("special dates can be removed", app.state.schedule.special.is_empty());
         app.state.schedule = Default::default();
         go_list(app);
     }
