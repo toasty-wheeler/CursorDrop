@@ -14,6 +14,8 @@ replace before you use it.
 
 ![The cursors in a pack, now vs. new](docs/cursors.png)
 
+![Choosing a different cursor for one slot](docs/picker.png)
+
 ![Dragging a pack onto the window](docs/drop.png)
 
 ## Download

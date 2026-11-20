@@ -11,6 +11,9 @@ Getting started
    "Add pack..." in the window, or drag the archive onto the window.
 3. It is applied within a couple of seconds. Click a pack in the list to see every cursor
    it replaces; packs with several variants get tabs to choose from.
+   Click any cursor there to pick a different one (from the pack, another pack, or keep
+   yours). "Current cursors", first in the list, lets you mix your own set and save it
+   as a preset.
 
 With "Close to tray" on (the default), closing the window keeps CursorDrop running in the
 tray (bottom right): click the tray icon to bring the window back, right-click it for the

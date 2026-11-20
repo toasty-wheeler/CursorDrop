@@ -2639,6 +2639,9 @@ pub fn self_test(app: &mut App, dir: &Path) {
                 && app.state.active.as_ref().is_some_and(|a| a.archive == "Dragged Pack.zip"),
         );
         let _ = std::fs::remove_dir_all(&tmp);
+        // Leave the folder as it was for the checks that follow.
+        let _ = std::fs::remove_file(app.drop_dir.join("Dragged Pack.zip"));
+        app.scan(false);
         go_list(app);
     }
 
